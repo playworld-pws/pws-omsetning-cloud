@@ -1,0 +1,17 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+.idea/
+.vscode/
+.DS_Store
+
+# Lokale PWS-data og innloggingsprofiler
+pws_live_data.json
+pws_triaden_live_data.json
+PlayworldBrowserProfile/
+history/
