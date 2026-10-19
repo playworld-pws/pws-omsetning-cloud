@@ -746,6 +746,57 @@ async def probe_nordpay_products(page: Page) -> None:
                     )
 
                     if label == "orders":
+                        history_info = await page.evaluate(
+                            """() => {
+                                const interesting = (s) => /date|start|end|page|offset|limit|force|period/i.test(s || '');
+                                const inputs = Array.from(document.querySelectorAll('input,select')).map(el => ({
+                                    tag: el.tagName,
+                                    name: el.getAttribute('name') || '',
+                                    id: el.id || '',
+                                    type: el.getAttribute('type') || '',
+                                    value: el.value || ''
+                                })).filter(x => interesting(x.name) || interesting(x.id) || /date/i.test(x.type));
+
+                                const links = Array.from(document.querySelectorAll('a[href]'))
+                                    .map(a => ({
+                                        text: (a.innerText || '').trim(),
+                                        href: a.getAttribute('href') || ''
+                                    }))
+                                    .filter(x => /page|date|start|end|force|orders/i.test(x.href) || /next|prev|older|newer|forrige|neste/i.test(x.text));
+
+                                const buttons = Array.from(document.querySelectorAll('button'))
+                                    .map(b => ({
+                                        text: (b.innerText || '').trim(),
+                                        name: b.getAttribute('name') || '',
+                                        value: b.getAttribute('value') || '',
+                                        data: Array.from(b.attributes)
+                                            .filter(a => a.name.startsWith('data-'))
+                                            .reduce((o,a) => { o[a.name]=a.value; return o; }, {})
+                                    }))
+                                    .filter(x => /next|prev|older|newer|forrige|neste|date|day|week|month/i.test(x.text + ' ' + x.name));
+
+                                const forms = Array.from(document.querySelectorAll('form')).map(f => ({
+                                    action: f.getAttribute('action') || '',
+                                    method: f.getAttribute('method') || ''
+                                })).filter(x => /order|date|report|setting/i.test(x.action));
+
+                                return {inputs, links: links.slice(0,50), buttons: buttons.slice(0,30), forms: forms.slice(0,20)};
+                            }"""
+                        )
+                        history_info["links"] = [
+                            {
+                                "text": str(x.get("text") or "")[:80],
+                                "href": _safe_url_pattern(str(x.get("href") or "")),
+                            }
+                            for x in (history_info.get("links") or [])
+                        ]
+                        print(
+                            "[nordpay] NORDPAY_HISTORY_PROBE="
+                            + json.dumps(history_info, ensure_ascii=False)[:5000],
+                            flush=True,
+                        )
+
+                    if label == "orders":
                         order_sample = await page.evaluate(
                             """() => {
                                 const t = Array.from(document.querySelectorAll('table')).find(tbl => {
