@@ -525,9 +525,9 @@ async def read_nordpay(page: Page) -> dict[str, Any]:
 
 def _safe_url_pattern(url: str) -> str:
     # Keep route structure, but avoid dumping transaction/order identifiers.
-    url = re.sub(r"([?&][^=]+=)[^&]+", r"\\1<value>", url)
+    url = re.sub(r"([?&][^=]+=)[^&]+", r"\1<value>", url)
     url = re.sub(r"/[0-9a-fA-F-]{8,}(?=/|$)", "/<id>", url)
-    url = re.sub(r"/\\d{3,}(?=/|$)", "/<id>", url)
+    url = re.sub(r"/\d{3,}(?=/|$)", "/<id>", url)
     return url[:500]
 
 
@@ -620,7 +620,7 @@ async def probe_nordpay_products(page: Page) -> None:
             # one order-detail page, but log structure only (no customer/payment values).
             first_order_edit = None
             for raw_link in (info.get("links") or []):
-                if re.search(r"/manage/orders/edit/\\d+", str(raw_link)):
+                if re.search(r"/manage/orders/edit/\d+", str(raw_link)):
                     first_order_edit = str(raw_link)
                     break
 
