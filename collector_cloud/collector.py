@@ -1236,6 +1236,143 @@ async def read_nordpay_daily_products(page: Page) -> list[dict[str, Any]]:
     return result
 
 
+async def nordpay_order_rows_for_date(
+    page: Page,
+    target_date: date,
+) -> list[dict[str, Any]]:
+    """Read all visible order pages for one NordPay business date."""
+    iso = target_date.isoformat()
+    all_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for page_no in range(1, 21):
+        relative_url = (
+            f"/manage/orders?starts={iso}&ends={iso}&page={page_no}"
+        )
+        result = await page.evaluate(
+            """async (relativeUrl) => {
+                const r = await fetch(relativeUrl, {
+                    credentials: 'include',
+                    cache: 'no-store',
+                    headers: {'X-Requested-With':'XMLHttpRequest'}
+                });
+                const txt = await r.text();
+                if (!r.ok) return {ok:false, status:r.status, rows:[]};
+                const doc = new DOMParser().parseFromString(txt, 'text/html');
+                const t = Array.from(doc.querySelectorAll('table')).find(tbl => {
+                    const h = Array.from(tbl.querySelectorAll('thead th'))
+                        .map(x => x.innerText.trim());
+                    return h.includes('ID') && h.includes('Created At') &&
+                           h.includes('Items') && h.includes('Status');
+                });
+                if (!t) return {ok:true, status:r.status, rows:[]};
+                const headers = Array.from(t.querySelectorAll('thead th'))
+                    .map(x => x.innerText.trim());
+                return {
+                    ok:true,
+                    status:r.status,
+                    rows:Array.from(t.querySelectorAll('tbody tr')).map(tr => {
+                        const cells = Array.from(tr.querySelectorAll('td'));
+                        const row = {};
+                        headers.forEach((h, i) => {
+                            row[h || ('col_' + i)] = (cells[i]?.innerText || '').trim();
+                        });
+                        const edit = tr.querySelector('a[href*="/manage/orders/edit/"]');
+                        if (edit) row.edit = edit.getAttribute('href');
+                        return row;
+                    })
+                };
+            }""",
+            relative_url,
+        )
+
+        if not result or not result.get("ok"):
+            raise RuntimeError(
+                f"NordPay ordrearkiv svarte HTTP {result.get('status') if result else '?'}"
+            )
+
+        rows = result.get("rows") or []
+        if not rows:
+            break
+
+        added = 0
+        for row in rows:
+            row_id = str(row.get("ID") or "").strip()
+            if row_id and row_id in seen_ids:
+                continue
+            if row_id:
+                seen_ids.add(row_id)
+            all_rows.append(row)
+            added += 1
+
+        # If page=N is ignored, page 2 will repeat page 1. Stop safely.
+        if added == 0:
+            break
+
+    return all_rows
+
+
+async def nordpay_products_for_date(
+    page: Page,
+    target_date: date,
+) -> list[dict[str, Any]]:
+    iso = target_date.isoformat()
+    orders = await nordpay_order_rows_for_date(page, target_date)
+
+    edits: list[str] = []
+    for order in orders:
+        created = str(order.get("Created At") or "").strip()
+        status = str(order.get("Status") or "").casefold()
+        edit = str(order.get("edit") or "").strip()
+        if created.startswith(iso) and "completed" in status and edit:
+            edits.append(edit)
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for edit in edits[:500]:
+        rows = await nordpay_order_items(page, edit)
+        for row in rows:
+            name = nordpay_product_label(row.get("Product"))
+            if not name:
+                continue
+
+            qty = parse_number(row.get("Qty"))
+            net = parse_nordpay_money(row.get("Price"))
+            tax_text = str(row.get("Tax") or "")
+            tax_amount = None
+            m_tax = re.search(
+                r"%\s*([0-9]+(?:[.,][0-9]{2})?)\s*(?:,-)?\s*kr",
+                tax_text,
+                flags=re.IGNORECASE,
+            )
+            if m_tax:
+                tax_amount = parse_nordpay_money(m_tax.group(1))
+
+            revenue = None if net is None else net + (tax_amount or 0.0)
+            display = canonical_product_name(name)
+            key = display.casefold()
+            item = grouped.setdefault(
+                key,
+                {
+                    "name": display,
+                    "quantity": 0.0,
+                    "revenue": 0.0,
+                    "source": "nordpay",
+                },
+            )
+            if qty is not None:
+                item["quantity"] += float(qty)
+            if revenue is not None:
+                item["revenue"] += float(revenue)
+
+    result = []
+    for item in grouped.values():
+        item["quantity"] = round(item["quantity"], 2)
+        item["revenue"] = round(item["revenue"], 2)
+        result.append(item)
+    result.sort(key=lambda x: float(x.get("revenue") or 0), reverse=True)
+    return result
+
+
 WEATHER_CODES = {
     0: "Klart",
     1: "For det meste klart",
@@ -1405,6 +1542,7 @@ async def ingest_product_history(
     park: str,
     business_date: str,
     products: list[dict[str, Any]],
+    source: str = "live",
 ) -> None:
     try:
         r = await client.post(
@@ -1413,6 +1551,7 @@ async def ingest_product_history(
             json={
                 "business_date": business_date,
                 "products": products,
+                "source": source,
             },
             timeout=30,
         )
@@ -1526,6 +1665,65 @@ class CloudCollector:
                 self.wall_product_probe_done.add(park)
             self.wall_states[park] = await context.storage_state()
             return data
+        finally:
+            await context.close()
+
+    async def fetch_wallmob_products_for_date(
+        self,
+        park: str,
+        username: str,
+        password: str,
+        login_type: str,
+        target_date: date,
+    ) -> list[dict[str, Any]] | None:
+        if self.wall_states.get(park) is None:
+            await self.fetch_wallmob(park, username, password, login_type)
+
+        context = await self._new_context(self.wall_states.get(park))
+        try:
+            page = await context.new_page()
+            await page.goto(WALLMOB_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(700)
+            body = await page.locator("body").inner_text()
+            if "Dagens omsetning" not in body:
+                return None
+
+            payload = await probe_wallmob_top_products(
+                page,
+                park,
+                verbose=False,
+                target_date=target_date,
+            )
+            self.wall_states[park] = await context.storage_state()
+            if payload is None:
+                return None
+            return wallmob_products_from_payload(payload)
+        finally:
+            await context.close()
+
+    async def fetch_nordpay_products_for_date(
+        self,
+        target_date: date,
+    ) -> list[dict[str, Any]] | None:
+        if self.nord_state is None:
+            await self.fetch_nordpay()
+
+        context = await self._new_context(self.nord_state)
+        try:
+            page = await context.new_page()
+            await page.goto(
+                f"{NORDPAY_BASE_URL}/dashboard",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await page.wait_for_timeout(700)
+            body = await page.locator("body").inner_text()
+            if "DAGENS SALG" not in body.upper():
+                return None
+
+            products = await nordpay_products_for_date(page, target_date)
+            self.nord_state = await context.storage_state()
+            return products
         finally:
             await context.close()
 
@@ -1682,6 +1880,97 @@ async def collect_once(
         )
 
 
+async def next_missing_product_date(
+    client: httpx.AsyncClient,
+    park: str,
+    start_date: date,
+    end_date: date,
+) -> date | None:
+    try:
+        r = await client.get(
+            f"{CLOUD_URL}/api/products/next-missing-date",
+            params={
+                "park": park,
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat(),
+            },
+            headers={"X-PWS-Key": APP_KEY},
+            timeout=20,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        raw = (r.json() or {}).get("next_missing_date")
+        return date.fromisoformat(raw) if raw else None
+    except Exception as exc:
+        print(f"[backfill] Kunne ikke lese fremdrift for {park}: {exc}", flush=True)
+        return None
+
+
+async def backfill_product_history_once(
+    collector: CloudCollector,
+    client: httpx.AsyncClient,
+) -> None:
+    start_date = date(2026, 1, 1)
+    end_date = datetime.now(OSLO).date() - timedelta(days=1)
+    if end_date < start_date:
+        return
+
+    # One missing date for each park per cycle. Everything is sequential so the
+    # 512 MB Render worker never keeps multiple browser contexts alive.
+    for park in ("sorlandet", "triaden"):
+        target = await next_missing_product_date(client, park, start_date, end_date)
+        if target is None:
+            continue
+
+        try:
+            if park == "sorlandet":
+                wall = await collector.fetch_wallmob_products_for_date(
+                    park,
+                    SORLANDET_WALLMOB_USER,
+                    SORLANDET_WALLMOB_PASSWORD,
+                    SORLANDET_WALLMOB_TYPE,
+                    target,
+                )
+                if wall is None:
+                    raise RuntimeError("Wallmob historikk kunne ikke leses")
+
+                nord = await collector.fetch_nordpay_products_for_date(target)
+                if nord is None:
+                    raise RuntimeError("NordPay historikk kunne ikke leses")
+
+                products = combine_product_sales(wall, nord)
+            else:
+                wall = await collector.fetch_wallmob_products_for_date(
+                    park,
+                    TRIADEN_WALLMOB_USER,
+                    TRIADEN_WALLMOB_PASSWORD,
+                    TRIADEN_WALLMOB_TYPE,
+                    target,
+                )
+                if wall is None:
+                    raise RuntimeError("Wallmob historikk kunne ikke leses")
+                products = combine_product_sales(wall)
+
+            await ingest_product_history(
+                client,
+                park,
+                target.isoformat(),
+                products,
+                source="backfill",
+            )
+            print(
+                f"[backfill] {park} {target.isoformat()} ferdig – "
+                f"{len(products)} produkter",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[backfill] {park} {target.isoformat()} FEIL: {exc}",
+                flush=True,
+            )
+
+
 def validate_base_secrets() -> None:
     missing = []
     if not INGEST_KEY:
@@ -1713,6 +2002,7 @@ async def main() -> None:
                 started = datetime.now(OSLO)
                 try:
                     await collect_once(collector, client)
+                    await backfill_product_history_once(collector, client)
                 except Exception as exc:
                     print(f"[collector] FEIL: {exc}", flush=True)
 
