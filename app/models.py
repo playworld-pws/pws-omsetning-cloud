@@ -53,3 +53,32 @@ class DailyProduct(Base):
             "business_date",
         ),
     )
+
+
+class ProductHistoryDay(Base):
+    __tablename__ = "product_history_days"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    park: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    business_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    product_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="live")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "park",
+            "business_date",
+            name="uq_product_history_days_park_date",
+        ),
+        Index(
+            "ix_product_history_days_park_date",
+            "park",
+            "business_date",
+        ),
+    )
