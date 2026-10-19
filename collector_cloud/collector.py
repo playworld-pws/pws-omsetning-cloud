@@ -302,7 +302,10 @@ async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True
     async def on_request(request):
         nonlocal captured_headers
         try:
-            if "bapi-etail.wallmob.com" not in request.url:
+            # Historical report calls need the same auth/resource headers as
+            # Wallmob's own performance-report request. Do not overwrite these
+            # with headers from unrelated public/configuration API calls.
+            if "bapi-etail.wallmob.com/reports/performance" not in request.url:
                 return
             headers = await request.all_headers()
             if headers:
@@ -399,11 +402,12 @@ async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True
 
         if status >= 400:
             print(
-                f"[{park}] TOP_PRODUCTS_PROBE HTTP {status}; "
+                f"[{park}] WALLMOB_HISTORY HTTP {status} "
+                f"date={requested_date.isoformat()}; "
                 f"captured_header_names={sorted(api_headers.keys())}",
                 flush=True,
             )
-            return
+            return None
 
         try:
             payload = json.loads(body)
