@@ -796,6 +796,74 @@ async def probe_nordpay_products(page: Page) -> None:
                             flush=True,
                         )
 
+
+                        # Try common read-only history/pagination query patterns and
+                        # compare the returned order dates/IDs. NordPay may ignore
+                        # unsupported parameters; the log makes that visible.
+                        candidate_urls = [
+                            "/manage/orders?page=2",
+                            "/manage/orders?page=3",
+                            "/manage/orders?offset=50",
+                            "/manage/orders?offset=100",
+                            "/manage/orders?limit=100",
+                            "/manage/orders?starts=2026-01-01&ends=2026-01-31",
+                            "/manage/orders?start=2026-01-01&end=2026-01-31",
+                            "/manage/orders?date=2026-01-15",
+                        ]
+
+                        query_results = []
+                        for candidate in candidate_urls:
+                            try:
+                                result = await page.evaluate(
+                                    """async (relativeUrl) => {
+                                        const r = await fetch(relativeUrl, {
+                                            credentials: 'include',
+                                            cache: 'no-store',
+                                            headers: {'X-Requested-With':'XMLHttpRequest'}
+                                        });
+                                        const txt = await r.text();
+                                        if (!r.ok) return {ok:false, status:r.status, rows:[]};
+                                        const doc = new DOMParser().parseFromString(txt, 'text/html');
+                                        const t = Array.from(doc.querySelectorAll('table')).find(tbl => {
+                                            const h = Array.from(tbl.querySelectorAll('thead th'))
+                                                .map(x => x.innerText.trim());
+                                            return h.includes('ID') && h.includes('Created At') && h.includes('Items');
+                                        });
+                                        if (!t) return {ok:true, status:r.status, rows:[]};
+                                        const headers = Array.from(t.querySelectorAll('thead th'))
+                                            .map(x => x.innerText.trim());
+                                        const idIdx = headers.indexOf('ID');
+                                        const dateIdx = headers.indexOf('Created At');
+                                        const rows = Array.from(t.querySelectorAll('tbody tr')).slice(0,5).map(tr => {
+                                            const cells = Array.from(tr.querySelectorAll('td'));
+                                            return {
+                                                id: idIdx >= 0 ? (cells[idIdx]?.innerText || '').trim() : '',
+                                                created_at: dateIdx >= 0 ? (cells[dateIdx]?.innerText || '').trim() : ''
+                                            };
+                                        });
+                                        return {ok:true, status:r.status, rows};
+                                    }""",
+                                    candidate,
+                                )
+                                query_results.push({
+                                    "url": _safe_url_pattern(candidate),
+                                    "ok": bool(result.get("ok")),
+                                    "status": result.get("status"),
+                                    "rows": result.get("rows") or [],
+                                })
+                            except Exception as exc:
+                                query_results.push({
+                                    "url": _safe_url_pattern(candidate),
+                                    "ok": False,
+                                    "error": str(exc)[:160],
+                                })
+
+                        print(
+                            "[nordpay] NORDPAY_HISTORY_QUERY_PROBE="
+                            + json.dumps(query_results, ensure_ascii=False)[:7000],
+                            flush=True,
+                        )
+
                     if label == "orders":
                         order_sample = await page.evaluate(
                             """() => {
