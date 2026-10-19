@@ -1237,6 +1237,38 @@ async def ingest(client: httpx.AsyncClient, park: str, payload: dict[str, Any]) 
         print(f"[{park}] PRODUKTER: {summary}", flush=True)
 
 
+async def ingest_product_history(
+    client: httpx.AsyncClient,
+    park: str,
+    business_date: str,
+    products: list[dict[str, Any]],
+) -> None:
+    try:
+        r = await client.post(
+            f"{CLOUD_URL}/api/products/ingest/{park}",
+            headers={"X-PWS-Ingest-Key": INGEST_KEY},
+            json={
+                "business_date": business_date,
+                "products": products,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        result = r.json()
+        print(
+            f"[{park}] PRODUKTHISTORIKK {business_date}: "
+            f"{result.get('products', 0)} produkter lagret",
+            flush=True,
+        )
+    except Exception as exc:
+        # API and worker can deploy a few seconds apart on Render. Keep live
+        # collection running and retry automatically on the next cycle.
+        print(
+            f"[{park}] PRODUKTHISTORIKK kunne ikke lagres ennå: {exc}",
+            flush=True,
+        )
+
+
 class CloudCollector:
     """Memory-light collector.
 
@@ -1412,6 +1444,12 @@ async def collect_once(
                 "hourly_status": "Skybasert timegraf – differanse mellom live snapshots",
             }
             await ingest(client, "sorlandet", payload)
+            await ingest_product_history(
+                client,
+                "sorlandet",
+                now.date().isoformat(),
+                combined_products,
+            )
         except Exception as exc:
             print(f"[sorlandet] FEIL: {exc}", flush=True)
     else:
@@ -1454,6 +1492,12 @@ async def collect_once(
                 "hourly_status": "Skybasert timegraf – differanse mellom live snapshots",
             }
             await ingest(client, "triaden", payload)
+            await ingest_product_history(
+                client,
+                "triaden",
+                now.date().isoformat(),
+                payload.get("product_sales") or [],
+            )
         except Exception as exc:
             print(f"[triaden] FEIL: {exc}", flush=True)
     else:
