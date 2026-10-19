@@ -668,6 +668,39 @@ async def probe_nordpay_products(page: Page) -> None:
                         + json.dumps(structure, ensure_ascii=False)[:4500],
                         flush=True,
                     )
+
+                    if label == "orders":
+                        order_sample = await page.evaluate(
+                            """() => {
+                                const t = Array.from(document.querySelectorAll('table')).find(tbl => {
+                                    const h = Array.from(tbl.querySelectorAll('thead th'))
+                                        .map(x => x.innerText.trim().toLowerCase());
+                                    return h.includes('id') && h.includes('created at') && h.includes('items');
+                                });
+                                if (!t) return [];
+                                const headers = Array.from(t.querySelectorAll('thead th'))
+                                    .map(x => x.innerText.trim());
+                                const allowed = new Set(['ID','Order','Order Nr','Queue Nr','Status','Created At','Items','Totals']);
+                                return Array.from(t.querySelectorAll('tbody tr')).slice(0,8).map(tr => {
+                                    const cells = Array.from(tr.querySelectorAll('td'));
+                                    const out = {};
+                                    headers.forEach((h, i) => {
+                                        if (allowed.has(h)) out[h] = (cells[i]?.innerText || '').trim();
+                                    });
+                                    const edit = tr.querySelector('a[href*="/manage/orders/edit/"]');
+                                    if (edit) out.edit = edit.getAttribute('href');
+                                    return out;
+                                });
+                            }"""
+                        )
+                        for row in order_sample:
+                            if row.get("edit"):
+                                row["edit"] = _safe_url_pattern(str(row["edit"]))
+                        print(
+                            "[nordpay] NORDPAY_PRODUCTS_PROBE order_list_sample="
+                            + json.dumps(order_sample, ensure_ascii=False)[:4500],
+                            flush=True,
+                        )
                 except Exception as exc:
                     print(
                         f"[nordpay] NORDPAY_PRODUCTS_PROBE {label}_structure FEIL: {exc}",
@@ -687,6 +720,43 @@ async def probe_nordpay_products(page: Page) -> None:
                     print(
                         "[nordpay] NORDPAY_PRODUCTS_PROBE order_detail_structure="
                         + json.dumps(structure, ensure_ascii=False)[:4500],
+                        flush=True,
+                    )
+
+
+                    # Log only the sold item rows from the first order. These
+                    # contain product/price/quantity business data and exclude
+                    # customer, receipt and payment tables.
+                    item_rows = await page.evaluate(
+                        """() => {
+                            const tables = Array.from(document.querySelectorAll('table'));
+                            for (const t of tables) {
+                                const headers = Array.from(t.querySelectorAll('thead th'))
+                                    .map(x => x.innerText.trim());
+                                const norm = headers.map(x => x.toLowerCase());
+                                if (
+                                    norm.includes('product') &&
+                                    norm.includes('unit price') &&
+                                    norm.includes('qty') &&
+                                    norm.includes('price')
+                                ) {
+                                    return Array.from(t.querySelectorAll('tbody tr'))
+                                        .slice(0,20)
+                                        .map(tr => {
+                                            const cells = Array.from(tr.querySelectorAll('td'))
+                                                .map(td => td.innerText.trim());
+                                            const row = {};
+                                            headers.forEach((h, i) => row[h || ('col_' + i)] = cells[i] ?? '');
+                                            return row;
+                                        });
+                                }
+                            }
+                            return [];
+                        }"""
+                    )
+                    print(
+                        "[nordpay] NORDPAY_PRODUCTS_PROBE order_item_sample="
+                        + json.dumps(item_rows, ensure_ascii=False)[:4500],
                         flush=True,
                     )
                 except Exception as exc:
