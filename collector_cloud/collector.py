@@ -1735,52 +1735,31 @@ class CloudCollector:
         context: BrowserContext,
         park: str,
     ) -> dict[str, Any]:
-        capture: dict[str, Any] = {
-            "url": None,
-            "headers": None,
-            "payload": None,
-        }
-
-        async def on_request(request):
-            try:
-                url = request.url
-                if (
-                    "bapi-etail.wallmob.com/reports/performance" not in url
-                    or "top_products" not in url
-                ):
-                    return
-                headers = await request.all_headers()
-                blocked = {
-                    "host",
-                    "content-length",
-                    "connection",
-                    "accept-encoding",
-                    "cookie",
-                }
-                capture["url"] = url
-                capture["headers"] = {
-                    k: v
-                    for k, v in headers.items()
-                    if k.lower() not in blocked and not k.startswith(":")
-                }
-            except Exception:
-                pass
+        capture: dict[str, Any] = {"url": None, "headers": None, "payload": None}
 
         async def on_response(response):
             try:
-                url = response.url
-                if (
-                    "bapi-etail.wallmob.com/reports/performance" in url
-                    and "top_products" in url
-                    and response.ok
-                ):
-                    payload = await response.json()
-                    if isinstance(payload, dict):
-                        capture["payload"] = payload
+                if "bapi-etail.wallmob.com/reports/performance" not in response.url:
+                    return
+                if not response.ok:
+                    return
+                payload = await response.json()
+                if not isinstance(payload, dict):
+                    return
+                if "top_products" not in payload:
+                    return
+                request = response.request
+                headers = await request.all_headers()
+                blocked = {"host", "content-length", "connection", "accept-encoding", "cookie"}
+                capture["url"] = request.url
+                capture["headers"] = {
+                    k: v for k, v in headers.items()
+                    if k.lower() not in blocked and not k.startswith(":")
+                }
+                capture["payload"] = payload
             except Exception:
                 pass
 
-        context.on("request", on_request)
         context.on("response", on_response)
         return capture
 
