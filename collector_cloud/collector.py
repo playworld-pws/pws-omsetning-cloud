@@ -19,7 +19,7 @@ CLOUD_URL = os.getenv("PWS_CLOUD_URL", "https://pws-omsetning-api.onrender.com")
 APP_KEY = os.getenv("PWS_APP_KEY", "")
 INGEST_KEY = os.getenv("PWS_INGEST_KEY", "")
 INTERVAL_SECONDS = max(30, int(os.getenv("PWS_COLLECT_INTERVAL", "60")))
-COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v5"
+COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v6"
 
 WALLMOB_LOGIN_URL = os.getenv(
     "WALLMOB_LOGIN_URL", "https://wbo-etail.wallmob.com/login"
@@ -1850,31 +1850,31 @@ class CloudCollector:
     async def fetch_wallmob(
         self, park: str, username: str, password: str, login_type: str
     ) -> dict[str, Any]:
-        async def read_live(
+        async def finalize(
             context: BrowserContext,
-            page: Page,
+            capture: dict[str, Any],
+            data: dict[str, Any],
         ) -> dict[str, Any]:
-            data = await read_wallmob(page)
+            for _ in range(16):
+                if capture.get("payload") is not None:
+                    break
+                await asyncio.sleep(0.5)
 
-            report_url = data.pop("_wallmob_report_url", None)
-            report_headers = data.pop("_wallmob_report_headers", None)
+            self._save_wallmob_capture(park, capture, data)
 
-            if report_url and isinstance(report_headers, dict) and report_headers:
-                self.wall_report_templates[park] = {
-                    "url": report_url,
-                    "headers": report_headers,
-                }
+            if capture.get("payload") is not None:
+                headers = capture.get("headers") or {}
                 print(
                     f"[{park}] WALLMOB_CAPTURE ok "
                     f"products={len(data.get('product_sales') or [])}; "
-                    f"header_names={sorted(report_headers.keys())}",
+                    f"header_names={sorted(headers.keys())}",
                     flush=True,
                 )
             else:
                 data["_product_sales_complete"] = False
                 print(
                     f"[{park}] WALLMOB_CAPTURE FEIL: "
-                    "top_products-request ble ikke fanget under første dashboardlast",
+                    "ingen performance-response med top_products ble observert",
                     flush=True,
                 )
 
@@ -1884,6 +1884,7 @@ class CloudCollector:
         state = self.wall_states.get(park)
         if state is not None:
             context = await self._new_context(state)
+            capture = self._install_wallmob_capture(context, park)
             try:
                 page = await context.new_page()
                 await page.goto(
@@ -1891,22 +1892,22 @@ class CloudCollector:
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
-                await page.wait_for_timeout(900)
+                await page.wait_for_timeout(1800)
                 body = await page.locator("body").inner_text()
                 if "Dagens omsetning" in body:
-                    return await read_live(context, page)
+                    data = await read_wallmob(page)
+                    return await finalize(context, capture, data)
             except Exception as exc:
-                print(
-                    f"[{park}] Wallmob lagret sesjon feilet: {exc}",
-                    flush=True,
-                )
+                print(f"[{park}] Wallmob lagret sesjon feilet: {exc}", flush=True)
             finally:
                 await context.close()
 
         context = await self._new_context()
+        capture = self._install_wallmob_capture(context, park)
         try:
             page = await login_wallmob(context, username, password, login_type)
-            return await read_live(context, page)
+            data = await read_wallmob(page)
+            return await finalize(context, capture, data)
         finally:
             await context.close()
 
