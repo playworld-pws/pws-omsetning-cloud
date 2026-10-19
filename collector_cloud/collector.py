@@ -200,9 +200,31 @@ async def login_wallmob(
 
 
 async def read_wallmob(page: Page) -> dict[str, Any]:
-    await page.goto(WALLMOB_HOME_URL, wait_until="domcontentloaded", timeout=45000)
-    await page.wait_for_timeout(1800)
-    text = await page.locator("body").inner_text()
+    performance_payloads: list[dict[str, Any]] = []
+
+    async def on_response(response):
+        try:
+            if (
+                "bapi-etail.wallmob.com/reports/performance" in response.url
+                and "top_products" in response.url
+                and response.ok
+            ):
+                payload = await response.json()
+                if isinstance(payload, dict):
+                    performance_payloads.append(payload)
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    try:
+        await page.goto(WALLMOB_HOME_URL, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(2200)
+        text = await page.locator("body").inner_text()
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
 
     if "Dagens omsetning" not in text:
         raise RuntimeError("Wallmob-sesjonen er ikke innlogget.")
@@ -217,12 +239,37 @@ async def read_wallmob(page: Page) -> dict[str, Any]:
     if turnover is None:
         raise RuntimeError("Wallmob: fant ikke dagens omsetning.")
 
+    product_sales: list[dict[str, Any]] = []
+    if performance_payloads:
+        report = performance_payloads[-1]
+        for item in report.get("top_products") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("product_name") or "").strip()
+            raw_turnover = parse_number(item.get("turnover"))
+            if not name or raw_turnover is None:
+                continue
+            # Wallmob performance API returns monetary values in øre.
+            revenue = round(raw_turnover / 100.0, 2)
+            product_sales.append(
+                {
+                    "name": name,
+                    "quantity": None,
+                    "revenue": revenue,
+                    "source": "wallmob",
+                    "source_id": item.get("product_id"),
+                }
+            )
+
+    product_sales.sort(key=lambda x: float(x.get("revenue") or 0), reverse=True)
+
     return {
         "ok": True,
         "turnover": turnover,
         "products": products,
         "orders": orders,
         "gross_margin": margin,
+        "product_sales": product_sales,
         "message": "OK – hentet direkte i PWS Cloud",
     }
 
@@ -780,6 +827,250 @@ async def probe_nordpay_products(page: Page) -> None:
         print(f"[nordpay] NORDPAY_PRODUCTS_PROBE FEIL: {exc}", flush=True)
 
 
+def parse_nordpay_money(value: Any) -> float | None:
+    """Parse NordPay money strings such as 169,-kr and 150.89,-kr."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = re.sub(r"(?i)\\bNOK\\b|\\bkr\\b", "", s)
+    s = re.sub(r"\\s+", "", s)
+    s = re.sub(r",-?$", "", s)
+    s = s.replace("−", "-")
+    negative = s.startswith("-")
+    s = s.lstrip("-")
+    s = re.sub(r"[^0-9,.]", "", s)
+    if not s:
+        return None
+
+    if "," in s and "." in s:
+        # Last separator is decimal; the other one is thousands.
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        tail = s.rsplit(",", 1)[-1]
+        if len(tail) == 2:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "." in s:
+        tail = s.rsplit(".", 1)[-1]
+        if len(tail) != 2:
+            s = s.replace(".", "")
+
+    try:
+        value_num = float(s)
+    except ValueError:
+        return None
+    return -value_num if negative else value_num
+
+
+def nordpay_product_label(value: Any) -> str:
+    text = str(value or "").replace("\\r", "\\n").strip()
+    if not text:
+        return ""
+    # NordPay places category/printer metadata on following lines.
+    first = next((line.strip() for line in text.split("\\n") if line.strip()), "")
+    return first
+
+
+def canonical_product_name(name: str) -> str:
+    clean = re.sub(r"\\s+", " ", str(name or "")).strip()
+    low = clean.casefold()
+
+    if "minigolf" in low:
+        return "Minigolf"
+    if "lek" in low:
+        if re.search(r"\\b30\\s*(?:min|minutt)", low):
+            return "Lek - 30 min"
+        if re.search(r"\\b1\\s*(?:time|timer|t)\\b", low):
+            return "Lek - 1 time"
+        if re.search(r"\\b2\\s*(?:time|timer|t)\\b", low):
+            return "Lek - 2 timer"
+        if "heldag" in low or "hele dagen" in low:
+            return "Lek - heldag"
+    return clean
+
+
+def combine_product_sales(*lists: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+
+    for items in lists:
+        for item in items or []:
+            raw_name = str(item.get("name") or "").strip()
+            if not raw_name:
+                continue
+            display = canonical_product_name(raw_name)
+            key = display.casefold()
+            current = grouped.setdefault(
+                key,
+                {
+                    "name": display,
+                    "quantity": 0.0,
+                    "quantity_complete": True,
+                    "revenue": 0.0,
+                    "sources": [],
+                },
+            )
+
+            qty = item.get("quantity")
+            if qty is None:
+                current["quantity_complete"] = False
+            else:
+                current["quantity"] += float(qty)
+
+            current["revenue"] += float(item.get("revenue") or 0)
+            source = str(item.get("source") or "")
+            if source and source not in current["sources"]:
+                current["sources"].append(source)
+
+    result = []
+    for item in grouped.values():
+        item["quantity"] = (
+            round(item["quantity"], 2) if item["quantity_complete"] else None
+        )
+        item["revenue"] = round(item["revenue"], 2)
+        result.append(item)
+
+    result.sort(key=lambda x: float(x.get("revenue") or 0), reverse=True)
+    return result
+
+
+async def nordpay_order_rows(page: Page) -> list[dict[str, Any]]:
+    await page.goto(
+        f"{NORDPAY_BASE_URL}/manage/orders",
+        wait_until="domcontentloaded",
+        timeout=45000,
+    )
+    await page.wait_for_timeout(1600)
+    rows = await page.evaluate(
+        """() => {
+            const tables = Array.from(document.querySelectorAll('table'));
+            const t = tables.find(tbl => {
+                const h = Array.from(tbl.querySelectorAll('thead th'))
+                    .map(x => x.innerText.trim());
+                return h.includes('Created At') && h.includes('Items') && h.includes('Status');
+            });
+            if (!t) return [];
+            const headers = Array.from(t.querySelectorAll('thead th'))
+                .map(x => x.innerText.trim());
+            return Array.from(t.querySelectorAll('tbody tr')).map(tr => {
+                const cells = Array.from(tr.querySelectorAll('td'));
+                const row = {};
+                headers.forEach((h, i) => row[h || ('col_' + i)] = (cells[i]?.innerText || '').trim());
+                const edit = tr.querySelector('a[href*="/manage/orders/edit/"]');
+                if (edit) row.edit = edit.getAttribute('href');
+                return row;
+            });
+        }"""
+    )
+    return rows if isinstance(rows, list) else []
+
+
+async def nordpay_order_items(page: Page, relative_url: str) -> list[dict[str, Any]]:
+    return await page.evaluate(
+        """async (relativeUrl) => {
+            const r = await fetch(relativeUrl, {
+                credentials: 'include',
+                cache: 'no-store',
+                headers: {'X-Requested-With':'XMLHttpRequest'}
+            });
+            const txt = await r.text();
+            if (!r.ok) return [];
+            const doc = new DOMParser().parseFromString(txt, 'text/html');
+            const tables = Array.from(doc.querySelectorAll('table'));
+            const t = tables.find(tbl => {
+                const h = Array.from(tbl.querySelectorAll('thead th'))
+                    .map(x => x.innerText.trim());
+                return h.includes('Product') && h.includes('Unit Price') &&
+                       h.includes('Tax') && h.includes('Qty') && h.includes('Price');
+            });
+            if (!t) return [];
+            const headers = Array.from(t.querySelectorAll('thead th'))
+                .map(x => x.innerText.trim());
+            return Array.from(t.querySelectorAll('tbody tr')).map(tr => {
+                const cells = Array.from(tr.querySelectorAll('td'));
+                const row = {};
+                headers.forEach((h, i) => row[h || ('col_' + i)] = (cells[i]?.innerText || '').trim());
+                return row;
+            });
+        }""",
+        relative_url,
+    )
+
+
+async def read_nordpay_daily_products(page: Page) -> list[dict[str, Any]]:
+    today = datetime.now(OSLO).strftime("%Y-%m-%d")
+    orders = await nordpay_order_rows(page)
+
+    completed = []
+    for order in orders:
+        created = str(order.get("Created At") or "").strip()
+        status = str(order.get("Status") or "").casefold()
+        edit = str(order.get("edit") or "").strip()
+        if created.startswith(today) and "completed" in status and edit:
+            completed.append(edit)
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for edit in completed[:300]:
+        try:
+            rows = await nordpay_order_items(page, edit)
+        except Exception as exc:
+            print(f"[nordpay] Kunne ikke lese ordrelinjer {edit}: {exc}", flush=True)
+            continue
+
+        for row in rows:
+            name = nordpay_product_label(row.get("Product"))
+            if not name:
+                continue
+            qty = parse_number(row.get("Qty"))
+            net = parse_nordpay_money(row.get("Price"))
+
+            tax_text = str(row.get("Tax") or "")
+            tax_amount = None
+            money_candidates = re.findall(
+                r"[-+]?[0-9][0-9 .]*(?:[.,][0-9]{2})?(?:,-)?\\s*(?:kr)?",
+                tax_text,
+                flags=re.IGNORECASE,
+            )
+            if money_candidates:
+                # Tax cells usually contain percentage first and tax amount second.
+                parsed = [parse_nordpay_money(x) for x in money_candidates]
+                parsed = [x for x in parsed if x is not None]
+                if parsed:
+                    tax_amount = parsed[-1]
+
+            revenue = None
+            if net is not None:
+                revenue = net + (tax_amount or 0.0)
+
+            key = canonical_product_name(name).casefold()
+            item = grouped.setdefault(
+                key,
+                {
+                    "name": canonical_product_name(name),
+                    "quantity": 0.0,
+                    "revenue": 0.0,
+                    "source": "nordpay",
+                },
+            )
+            if qty is not None:
+                item["quantity"] += float(qty)
+            if revenue is not None:
+                item["revenue"] += float(revenue)
+
+    result = []
+    for item in grouped.values():
+        item["quantity"] = round(item["quantity"], 2)
+        item["revenue"] = round(item["revenue"], 2)
+        result.append(item)
+    result.sort(key=lambda x: float(x.get("revenue") or 0), reverse=True)
+    return result
+
+
 WEATHER_CODES = {
     0: "Klart",
     1: "For det meste klart",
@@ -935,6 +1226,13 @@ async def ingest(client: httpx.AsyncClient, park: str, payload: dict[str, Any]) 
         f"NordPay {payload['nordpay'].get('turnover')}",
         flush=True,
     )
+    product_sales = payload.get("product_sales") or []
+    if product_sales:
+        summary = ", ".join(
+            f"{p.get('name')}={p.get('revenue')}kr"
+            for p in product_sales[:5]
+        )
+        print(f"[{park}] PRODUKTER: {summary}", flush=True)
 
 
 class CloudCollector:
@@ -1041,6 +1339,7 @@ class CloudCollector:
                         if not self.nord_product_probe_done:
                             await probe_nordpay_products(page)
                             self.nord_product_probe_done = True
+                        data["product_sales"] = await read_nordpay_daily_products(page)
                         self.nord_state = await context.storage_state()
                         return data
                 except Exception:
@@ -1060,6 +1359,7 @@ class CloudCollector:
             if not self.nord_product_probe_done:
                 await probe_nordpay_products(page)
                 self.nord_product_probe_done = True
+            data["product_sales"] = await read_nordpay_daily_products(page)
             self.nord_state = await context.storage_state()
             return data
         finally:
@@ -1088,6 +1388,9 @@ async def collect_once(
                 raise RuntimeError("Mangler NORDPAY_USERNAME/NORDPAY_PASSWORD i Render.")
 
             nord = await collector.fetch_nordpay()
+            combined_products = combine_product_sales(
+                wall.get("product_sales"), nord.get("product_sales")
+            )
             prev = await latest_payload(client, "sorlandet")
             hourly = build_hourly(prev, wall.get("turnover"), nord.get("turnover"), now)
             w = await weather(
@@ -1101,6 +1404,7 @@ async def collect_once(
                 "weather": w,
                 "wallmob": wall,
                 "nordpay": nord,
+                "product_sales": combined_products,
                 "hourly_revenue": hourly,
                 "nordpay_time": hourly,
                 "hourly_status": "Skybasert timegraf – differanse mellom live snapshots",
@@ -1142,6 +1446,7 @@ async def collect_once(
                 "weather": w,
                 "wallmob": wall,
                 "nordpay": nord,
+                "product_sales": combine_product_sales(wall.get("product_sales")),
                 "hourly_revenue": hourly,
                 "nordpay_time": hourly,
                 "hourly_status": "Skybasert timegraf – differanse mellom live snapshots",
