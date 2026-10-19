@@ -19,7 +19,7 @@ CLOUD_URL = os.getenv("PWS_CLOUD_URL", "https://pws-omsetning-api.onrender.com")
 APP_KEY = os.getenv("PWS_APP_KEY", "")
 INGEST_KEY = os.getenv("PWS_INGEST_KEY", "")
 INTERVAL_SECONDS = max(30, int(os.getenv("PWS_COLLECT_INTERVAL", "60")))
-COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v4"
+COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v5"
 
 WALLMOB_LOGIN_URL = os.getenv(
     "WALLMOB_LOGIN_URL", "https://wbo-etail.wallmob.com/login"
@@ -202,6 +202,7 @@ async def login_wallmob(
 
 async def read_wallmob(page: Page) -> dict[str, Any]:
     performance_payloads: list[dict[str, Any]] = []
+    performance_requests: list[dict[str, Any]] = []
 
     async def on_response(response):
         try:
@@ -213,13 +214,40 @@ async def read_wallmob(page: Page) -> dict[str, Any]:
                 payload = await response.json()
                 if isinstance(payload, dict):
                     performance_payloads.append(payload)
+
+                    request = response.request
+                    headers = await request.all_headers()
+                    blocked = {
+                        "host",
+                        "content-length",
+                        "connection",
+                        "accept-encoding",
+                        "cookie",
+                    }
+                    safe_headers = {
+                        k: v
+                        for k, v in headers.items()
+                        if k.lower() not in blocked and not k.startswith(":")
+                    }
+                    performance_requests.append(
+                        {
+                            "url": request.url,
+                            "headers": safe_headers,
+                        }
+                    )
         except Exception:
             pass
 
     page.on("response", on_response)
     try:
         await page.goto(WALLMOB_HOME_URL, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(2200)
+        # Wallmob is an SPA. The top_products report can arrive several seconds
+        # after DOMContentLoaded on Render. Keep the listener alive until it is
+        # captured, without forcing a second reload.
+        for _ in range(16):
+            if performance_payloads:
+                break
+            await page.wait_for_timeout(500)
         text = await page.locator("body").inner_text()
     finally:
         try:
@@ -272,6 +300,12 @@ async def read_wallmob(page: Page) -> dict[str, Any]:
         "gross_margin": margin,
         "product_sales": product_sales,
         "_product_sales_complete": bool(performance_payloads),
+        "_wallmob_report_url": (
+            performance_requests[-1]["url"] if performance_requests else None
+        ),
+        "_wallmob_report_headers": (
+            performance_requests[-1]["headers"] if performance_requests else None
+        ),
         "message": "OK – hentet direkte i PWS Cloud",
     }
 
@@ -1843,18 +1877,27 @@ class CloudCollector:
         ) -> dict[str, Any]:
             data = await read_wallmob(page)
 
-            captured = await capture_wallmob_performance_request(page, park)
-            if captured is not None:
+            report_url = data.pop("_wallmob_report_url", None)
+            report_headers = data.pop("_wallmob_report_headers", None)
+
+            if report_url and isinstance(report_headers, dict) and report_headers:
                 self.wall_report_templates[park] = {
-                    "url": captured["url"],
-                    "headers": captured["headers"],
+                    "url": report_url,
+                    "headers": report_headers,
                 }
-                products = wallmob_products_from_payload(captured["payload"])
-                data["product_sales"] = products
-                live_turnover = float(data.get("turnover") or 0)
-                data["_product_sales_complete"] = bool(products) or live_turnover == 0
+                print(
+                    f"[{park}] WALLMOB_CAPTURE ok "
+                    f"products={len(data.get('product_sales') or [])}; "
+                    f"header_names={sorted(report_headers.keys())}",
+                    flush=True,
+                )
             else:
                 data["_product_sales_complete"] = False
+                print(
+                    f"[{park}] WALLMOB_CAPTURE FEIL: "
+                    "top_products-request ble ikke fanget under første dashboardlast",
+                    flush=True,
+                )
 
             self.wall_states[park] = await context.storage_state()
             return data
