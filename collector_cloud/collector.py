@@ -831,21 +831,26 @@ def parse_nordpay_money(value: Any) -> float | None:
     """Parse NordPay money strings such as 169,-kr and 150.89,-kr."""
     if value is None:
         return None
+
     s = str(value).strip()
     if not s:
         return None
+
+    negative = s.startswith("-") or (s.startswith("(") and s.endswith(")"))
     s = re.sub(r"(?i)\\bNOK\\b|\\bkr\\b", "", s)
     s = re.sub(r"\\s+", "", s)
+    s = s.replace("−", "-").replace("(", "").replace(")", "")
+
+    # NordPay uses the price suffix ',-' even when the actual amount has
+    # decimals with a dot, e.g. '150.89,-kr'. Remove only that suffix first.
     s = re.sub(r",-?$", "", s)
-    s = s.replace("−", "-")
-    negative = s.startswith("-")
+    s = re.sub(r"\\.-?$", "", s) if re.fullmatch(r"\\d+\\.-?", s) else s
     s = s.lstrip("-")
     s = re.sub(r"[^0-9,.]", "", s)
     if not s:
         return None
 
     if "," in s and "." in s:
-        # Last separator is decimal; the other one is thousands.
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
@@ -862,10 +867,11 @@ def parse_nordpay_money(value: Any) -> float | None:
             s = s.replace(".", "")
 
     try:
-        value_num = float(s)
+        number = float(s)
     except ValueError:
         return None
-    return -value_num if negative else value_num
+
+    return -abs(number) if negative else abs(number)
 
 
 def nordpay_product_label(value: Any) -> str:
@@ -1229,7 +1235,7 @@ async def ingest(client: httpx.AsyncClient, park: str, payload: dict[str, Any]) 
     product_sales = payload.get("product_sales") or []
     if product_sales:
         summary = ", ".join(
-            f"{p.get('name')}={p.get('revenue')}kr"
+            f"{str(p.get('name') or '').splitlines()[0]}={p.get('revenue')}kr"
             for p in product_sales[:5]
         )
         print(f"[{park}] PRODUKTER: {summary}", flush=True)
