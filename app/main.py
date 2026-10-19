@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import Base, SessionLocal, engine
-from .models import DailyProduct, Snapshot
+from .models import DailyProduct, ProductHistoryDay, Snapshot
 
 
 OSLO = ZoneInfo("Europe/Oslo")
@@ -244,12 +244,32 @@ def ingest_products(
         )
         inserted += 1
 
+    source = str(payload.get("source") or "live").strip().lower()[:32] or "live"
+    history_day = db.execute(
+        select(ProductHistoryDay).where(
+            ProductHistoryDay.park == park,
+            ProductHistoryDay.business_date == business_date,
+        )
+    ).scalars().first()
+    if history_day is None:
+        history_day = ProductHistoryDay(
+            park=park,
+            business_date=business_date,
+            product_count=inserted,
+            source=source,
+        )
+        db.add(history_day)
+    else:
+        history_day.product_count = inserted
+        history_day.source = source
+
     db.commit()
     return {
         "ok": True,
         "park": park,
         "business_date": business_date.isoformat(),
         "products": inserted,
+        "source": source,
     }
 
 
@@ -336,4 +356,50 @@ def products(
         "days_with_product_data": len(covered_dates),
         "covered_dates": sorted(covered_dates),
         "products": result[:limit],
+    }
+
+
+@app.get("/api/products/next-missing-date", dependencies=[Depends(require_app_key)])
+def next_missing_product_date(
+    park: str = Query(...),
+    start: date = Query(...),
+    end: date = Query(...),
+    db: Session = Depends(db_session),
+) -> dict[str, Any]:
+    park = normalize_park(park)
+    if end < start:
+        raise HTTPException(status_code=400, detail="end må være lik eller etter start")
+
+    covered = set(
+        db.execute(
+            select(ProductHistoryDay.business_date).where(
+                ProductHistoryDay.park == park,
+                ProductHistoryDay.business_date >= start,
+                ProductHistoryDay.business_date <= end,
+            )
+        ).scalars().all()
+    )
+
+    cursor = start
+    while cursor <= end:
+        if cursor not in covered:
+            return {
+                "ok": True,
+                "park": park,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "next_missing_date": cursor.isoformat(),
+                "complete": False,
+                "covered_days": len(covered),
+            }
+        cursor += timedelta(days=1)
+
+    return {
+        "ok": True,
+        "park": park,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "next_missing_date": None,
+        "complete": True,
+        "covered_days": len(covered),
     }
