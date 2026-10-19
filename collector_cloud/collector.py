@@ -19,7 +19,7 @@ CLOUD_URL = os.getenv("PWS_CLOUD_URL", "https://pws-omsetning-api.onrender.com")
 APP_KEY = os.getenv("PWS_APP_KEY", "")
 INGEST_KEY = os.getenv("PWS_INGEST_KEY", "")
 INTERVAL_SECONDS = max(30, int(os.getenv("PWS_COLLECT_INTERVAL", "60")))
-COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v3"
+COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v4"
 
 WALLMOB_LOGIN_URL = os.getenv(
     "WALLMOB_LOGIN_URL", "https://wbo-etail.wallmob.com/login"
@@ -1603,20 +1603,23 @@ async def capture_wallmob_performance_request(
 
     try:
         async with page.expect_request(
-            lambda request: wanted(request.url),
-            timeout=15000,
+            lambda request: wanted(request.url) and request.method.upper() == "GET",
+            timeout=20000,
         ) as request_info:
-            async with page.expect_response(
-                lambda response: wanted(response.url),
-                timeout=15000,
-            ) as response_info:
-                await page.reload(
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
+            await page.reload(
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
 
         request = await request_info.value
-        response = await response_info.value
+        response = await asyncio.wait_for(request.response(), timeout=30000)
+        if response is None:
+            print(
+                f"[{park}] WALLMOB_CAPTURE FEIL: request fikk ingen response",
+                flush=True,
+            )
+            return None
+
         headers = await request.all_headers()
 
         blocked = {
