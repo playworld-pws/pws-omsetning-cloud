@@ -4,7 +4,7 @@ import asyncio
 import os
 import re
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
@@ -294,7 +294,7 @@ def _safe_shape(value: Any, depth: int = 0) -> Any:
     return value
 
 
-async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True) -> dict[str, Any] | None:
+async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True, target_date: date | None = None) -> dict[str, Any] | None:
     """Discover Wallmob's top_products response shape without logging credentials."""
     captured_headers: dict[str, str] = {}
     captured_top_products: list[Any] = []
@@ -330,7 +330,10 @@ async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True
         await page.reload(wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(2500)
 
-        if captured_top_products:
+        requested_date = target_date or datetime.now(OSLO).date()
+        today = datetime.now(OSLO).date()
+
+        if captured_top_products and requested_date == today:
             payload = captured_top_products[-1]
             if verbose:
                 sample = _safe_shape(payload)
@@ -357,11 +360,23 @@ async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True
             if key.lower() in allowed
         }
 
-        now = datetime.now(OSLO)
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = datetime(
+            requested_date.year,
+            requested_date.month,
+            requested_date.day,
+            0,
+            0,
+            0,
+            tzinfo=OSLO,
+        )
+        if requested_date == today:
+            end = datetime.now(OSLO)
+        else:
+            end = start + timedelta(days=1) - timedelta(seconds=1)
+
         params = {
             "starttime": int(start.timestamp()),
-            "endtime": int(now.timestamp()),
+            "endtime": int(end.timestamp()),
             "interval_grouping": 999999999,
             "include_vat": 1,
             "reports": json.dumps(
