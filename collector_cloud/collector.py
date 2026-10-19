@@ -19,6 +19,7 @@ CLOUD_URL = os.getenv("PWS_CLOUD_URL", "https://pws-omsetning-api.onrender.com")
 APP_KEY = os.getenv("PWS_APP_KEY", "")
 INGEST_KEY = os.getenv("PWS_INGEST_KEY", "")
 INTERVAL_SECONDS = max(30, int(os.getenv("PWS_COLLECT_INTERVAL", "60")))
+COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v2"
 
 WALLMOB_LOGIN_URL = os.getenv(
     "WALLMOB_LOGIN_URL", "https://wbo-etail.wallmob.com/login"
@@ -270,6 +271,7 @@ async def read_wallmob(page: Page) -> dict[str, Any]:
         "orders": orders,
         "gross_margin": margin,
         "product_sales": product_sales,
+        "_product_sales_complete": bool(performance_payloads),
         "message": "OK – hentet direkte i PWS Cloud",
     }
 
@@ -1697,8 +1699,8 @@ class CloudCollector:
         payload = capture.get("payload")
         if data is not None and isinstance(payload, dict):
             products = wallmob_products_from_payload(payload)
-            if products:
-                data["product_sales"] = products
+            data["product_sales"] = products
+            data["_product_sales_complete"] = True
 
     async def _wallmob_history_payload(
         self,
@@ -1974,12 +1976,19 @@ async def collect_once(
                 "hourly_status": "Skybasert timegraf – differanse mellom live snapshots",
             }
             await ingest(client, "sorlandet", payload)
-            await ingest_product_history(
-                client,
-                "sorlandet",
-                now.date().isoformat(),
-                combined_products,
-            )
+            if wall.get("_product_sales_complete"):
+                await ingest_product_history(
+                    client,
+                    "sorlandet",
+                    now.date().isoformat(),
+                    combined_products,
+                )
+            else:
+                print(
+                    "[sorlandet] PRODUKTHISTORIKK hoppet over – "
+                    "Wallmob produktlisten var ikke komplett",
+                    flush=True,
+                )
         except Exception as exc:
             print(f"[sorlandet] FEIL: {exc}", flush=True)
     else:
@@ -2022,12 +2031,19 @@ async def collect_once(
                 "hourly_status": "Skybasert timegraf – differanse mellom live snapshots",
             }
             await ingest(client, "triaden", payload)
-            await ingest_product_history(
-                client,
-                "triaden",
-                now.date().isoformat(),
-                payload.get("product_sales") or [],
-            )
+            if wall.get("_product_sales_complete"):
+                await ingest_product_history(
+                    client,
+                    "triaden",
+                    now.date().isoformat(),
+                    payload.get("product_sales") or [],
+                )
+            else:
+                print(
+                    "[triaden] PRODUKTHISTORIKK hoppet over – "
+                    "Wallmob produktlisten var ikke komplett",
+                    flush=True,
+                )
         except Exception as exc:
             print(f"[triaden] FEIL: {exc}", flush=True)
     else:
@@ -2141,6 +2157,7 @@ def validate_base_secrets() -> None:
 async def main() -> None:
     validate_base_secrets()
     print("PWS Cloud Collector starter.", flush=True)
+    print(f"Build: {COLLECTOR_BUILD}", flush=True)
     print(f"API: {CLOUD_URL}", flush=True)
     print(f"Intervall: {INTERVAL_SECONDS} sek", flush=True)
 
