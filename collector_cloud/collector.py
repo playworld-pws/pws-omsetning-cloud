@@ -539,76 +539,118 @@ async def ingest(client: httpx.AsyncClient, park: str, payload: dict[str, Any]) 
 
 
 class CloudCollector:
+    """Memory-light collector.
+
+    Only one browser context/page is kept open at a time. Login state is
+    preserved as small Playwright storage-state dictionaries between polls.
+    This is important on Render's 512 MB worker plan.
+    """
+
     def __init__(self, browser: Browser):
         self.browser = browser
-        self.wall_s_ctx: BrowserContext | None = None
-        self.wall_t_ctx: BrowserContext | None = None
-        self.nord_ctx: BrowserContext | None = None
-        self.wall_s_page: Page | None = None
-        self.wall_t_page: Page | None = None
-        self.nord_page: Page | None = None
+        self.wall_states: dict[str, dict[str, Any] | None] = {
+            "sorlandet": None,
+            "triaden": None,
+        }
+        self.nord_state: dict[str, Any] | None = None
 
-    async def _new_context(self) -> BrowserContext:
-        return await self.browser.new_context(
+    async def _new_context(
+        self, storage_state: dict[str, Any] | None = None
+    ) -> BrowserContext:
+        context = await self.browser.new_context(
             locale="nb-NO",
             timezone_id="Europe/Oslo",
             ignore_https_errors=True,
+            storage_state=storage_state,
         )
 
-    async def ensure_wallmob(
+        async def block_heavy(route):
+            if route.request.resource_type in {"image", "media", "font"}:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await context.route("**/*", block_heavy)
+        return context
+
+    async def fetch_wallmob(
         self, park: str, username: str, password: str, login_type: str
-    ) -> Page:
-        if park == "sorlandet":
-            ctx, page = self.wall_s_ctx, self.wall_s_page
-        else:
-            ctx, page = self.wall_t_ctx, self.wall_t_page
+    ) -> dict[str, Any]:
+        state = self.wall_states.get(park)
+        context = await self._new_context(state)
+        try:
+            page = await context.new_page()
 
-        if ctx is None:
-            ctx = await self._new_context()
-            page = None
-
-        if page is not None:
-            try:
-                return page if (await read_wallmob(page)).get("ok") else page
-            except Exception:
+            # Reuse the previous login session when possible.
+            if state is not None:
                 try:
-                    await page.close()
+                    await page.goto(
+                        WALLMOB_HOME_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    await page.wait_for_timeout(900)
+                    body = await page.locator("body").inner_text()
+                    if "Dagens omsetning" in body:
+                        data = await read_wallmob(page)
+                        self.wall_states[park] = await context.storage_state()
+                        return data
                 except Exception:
                     pass
-                page = None
 
-        page = await login_wallmob(ctx, username, password, login_type)
-
-        if park == "sorlandet":
-            self.wall_s_ctx, self.wall_s_page = ctx, page
-        else:
-            self.wall_t_ctx, self.wall_t_page = ctx, page
-        return page
-
-    async def ensure_nordpay(self) -> Page:
-        if self.nord_ctx is None:
-            self.nord_ctx = await self._new_context()
-
-        if self.nord_page is not None:
             try:
-                await self.nord_page.goto(
-                    f"{NORDPAY_BASE_URL}/dashboard",
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
-                body = await self.nord_page.locator("body").inner_text()
-                if "DAGENS SALG" in body.upper():
-                    return self.nord_page
+                await page.close()
             except Exception:
                 pass
+        finally:
+            await context.close()
+
+        # Session expired or first run: log in in a fresh lightweight context.
+        context = await self._new_context()
+        try:
+            page = await login_wallmob(context, username, password, login_type)
+            data = await read_wallmob(page)
+            self.wall_states[park] = await context.storage_state()
+            return data
+        finally:
+            await context.close()
+
+    async def fetch_nordpay(self) -> dict[str, Any]:
+        context = await self._new_context(self.nord_state)
+        try:
+            page = await context.new_page()
+
+            if self.nord_state is not None:
+                try:
+                    await page.goto(
+                        f"{NORDPAY_BASE_URL}/dashboard",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    await page.wait_for_timeout(900)
+                    body = await page.locator("body").inner_text()
+                    if "DAGENS SALG" in body.upper():
+                        data = await read_nordpay(page)
+                        self.nord_state = await context.storage_state()
+                        return data
+                except Exception:
+                    pass
+
             try:
-                await self.nord_page.close()
+                await page.close()
             except Exception:
                 pass
-            self.nord_page = None
+        finally:
+            await context.close()
 
-        self.nord_page = await login_nordpay(self.nord_ctx)
-        return self.nord_page
+        context = await self._new_context()
+        try:
+            page = await login_nordpay(context)
+            data = await read_nordpay(page)
+            self.nord_state = await context.storage_state()
+            return data
+        finally:
+            await context.close()
 
 
 async def collect_once(
@@ -619,19 +661,20 @@ async def collect_once(
 
     if SORLANDET_WALLMOB_USER and SORLANDET_WALLMOB_PASSWORD:
         try:
-            wall_page = await collector.ensure_wallmob(
+            # Fetch each source sequentially. The browser context is closed
+            # immediately after each source so Chromium cannot accumulate
+            # three dashboards in RAM at the same time.
+            wall = await collector.fetch_wallmob(
                 "sorlandet",
                 SORLANDET_WALLMOB_USER,
                 SORLANDET_WALLMOB_PASSWORD,
                 SORLANDET_WALLMOB_TYPE,
             )
-            wall = await read_wallmob(wall_page)
 
             if not NORDPAY_USER or not NORDPAY_PASSWORD:
                 raise RuntimeError("Mangler NORDPAY_USERNAME/NORDPAY_PASSWORD i Render.")
 
-            nord_page = await collector.ensure_nordpay()
-            nord = await read_nordpay(nord_page)
+            nord = await collector.fetch_nordpay()
             prev = await latest_payload(client, "sorlandet")
             hourly = build_hourly(prev, wall.get("turnover"), nord.get("turnover"), now)
             w = await weather(
@@ -660,13 +703,12 @@ async def collect_once(
 
     if TRIADEN_WALLMOB_USER and TRIADEN_WALLMOB_PASSWORD:
         try:
-            wall_page = await collector.ensure_wallmob(
+            wall = await collector.fetch_wallmob(
                 "triaden",
                 TRIADEN_WALLMOB_USER,
                 TRIADEN_WALLMOB_PASSWORD,
                 TRIADEN_WALLMOB_TYPE,
             )
-            wall = await read_wallmob(wall_page)
             nord = {
                 "ok": True,
                 "turnover": 0.0,
