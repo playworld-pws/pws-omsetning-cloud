@@ -614,6 +614,86 @@ async def probe_nordpay_products(page: Page) -> None:
                 + json.dumps(safe_info, ensure_ascii=False)[:5000],
                 flush=True,
             )
+
+
+            # Deeper, still read-only discovery: inspect products/orders pages and
+            # one order-detail page, but log structure only (no customer/payment values).
+            first_order_edit = None
+            for raw_link in (info.get("links") or []):
+                if re.search(r"/manage/orders/edit/\\d+", str(raw_link)):
+                    first_order_edit = str(raw_link)
+                    break
+
+            async def page_structure(relative_url: str) -> dict[str, Any]:
+                await page.goto(
+                    f"{NORDPAY_BASE_URL}{relative_url}",
+                    wait_until="domcontentloaded",
+                    timeout=45000,
+                )
+                await page.wait_for_timeout(1800)
+                return await page.evaluate(
+                    """() => ({
+                        title: document.title,
+                        headings: Array.from(document.querySelectorAll('h1,h2,h3,h4'))
+                            .map(x => x.innerText.trim())
+                            .filter(Boolean)
+                            .slice(0,20),
+                        table_headers: Array.from(document.querySelectorAll('table')).map(t =>
+                            Array.from(t.querySelectorAll('thead th')).map(x => x.innerText.trim())
+                        ).slice(0,10),
+                        form_labels: Array.from(document.querySelectorAll('label'))
+                            .map(x => x.innerText.trim())
+                            .filter(Boolean)
+                            .slice(0,40),
+                        link_patterns: Array.from(document.querySelectorAll('a[href]'))
+                            .map(a => a.getAttribute('href'))
+                            .filter(Boolean)
+                            .filter(h => /product|item|order|ticket|sale/i.test(h))
+                            .slice(0,40)
+                    })"""
+                )
+
+            for label, rel in (
+                ("products", "/manage/products"),
+                ("orders", "/manage/orders"),
+            ):
+                try:
+                    structure = await page_structure(rel)
+                    structure["link_patterns"] = [
+                        _safe_url_pattern(str(x))
+                        for x in (structure.get("link_patterns") or [])
+                    ]
+                    print(
+                        f"[nordpay] NORDPAY_PRODUCTS_PROBE {label}_structure="
+                        + json.dumps(structure, ensure_ascii=False)[:4500],
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[nordpay] NORDPAY_PRODUCTS_PROBE {label}_structure FEIL: {exc}",
+                        flush=True,
+                    )
+
+            if first_order_edit:
+                try:
+                    rel = first_order_edit
+                    if rel.startswith(NORDPAY_BASE_URL):
+                        rel = rel[len(NORDPAY_BASE_URL):]
+                    structure = await page_structure(rel)
+                    structure["link_patterns"] = [
+                        _safe_url_pattern(str(x))
+                        for x in (structure.get("link_patterns") or [])
+                    ]
+                    print(
+                        "[nordpay] NORDPAY_PRODUCTS_PROBE order_detail_structure="
+                        + json.dumps(structure, ensure_ascii=False)[:4500],
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[nordpay] NORDPAY_PRODUCTS_PROBE order_detail_structure FEIL: {exc}",
+                        flush=True,
+                    )
         finally:
             try:
                 page.remove_listener("response", on_response)
