@@ -837,14 +837,12 @@ def parse_nordpay_money(value: Any) -> float | None:
         return None
 
     negative = s.startswith("-") or (s.startswith("(") and s.endswith(")"))
-    s = re.sub(r"(?i)\\bNOK\\b|\\bkr\\b", "", s)
-    s = re.sub(r"\\s+", "", s)
+    s = re.sub(r"(?i)\bNOK\b|\bkr\b", "", s)
+    s = re.sub(r"\s+", "", s)
     s = s.replace("−", "-").replace("(", "").replace(")", "")
 
-    # NordPay uses the price suffix ',-' even when the actual amount has
-    # decimals with a dot, e.g. '150.89,-kr'. Remove only that suffix first.
-    s = re.sub(r",-?$", "", s)
-    s = re.sub(r"\\.-?$", "", s) if re.fullmatch(r"\\d+\\.-?", s) else s
+    # NordPay may append ',-' after a decimal amount, e.g. 150.89,-kr.
+    s = re.sub(r",-$", "", s)
     s = s.lstrip("-")
     s = re.sub(r"[^0-9,.]", "", s)
     if not s:
@@ -875,26 +873,25 @@ def parse_nordpay_money(value: Any) -> float | None:
 
 
 def nordpay_product_label(value: Any) -> str:
-    text = str(value or "").replace("\\r", "\\n").strip()
+    text = str(value or "").strip()
     if not text:
         return ""
-    # NordPay places category/printer metadata on following lines.
-    first = next((line.strip() for line in text.split("\\n") if line.strip()), "")
-    return first
+    # Product innerText contains product name on first line and metadata below.
+    return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
 
 def canonical_product_name(name: str) -> str:
-    clean = re.sub(r"\\s+", " ", str(name or "")).strip()
+    clean = re.sub(r"\s+", " ", str(name or "")).strip()
     low = clean.casefold()
 
     if "minigolf" in low:
         return "Minigolf"
     if "lek" in low:
-        if re.search(r"\\b30\\s*(?:min|minutt)", low):
+        if re.search(r"\b30\s*(?:min|minutt)", low):
             return "Lek - 30 min"
-        if re.search(r"\\b1\\s*(?:time|timer|t)\\b", low):
+        if re.search(r"\b1\s*(?:time|timer|t)\b", low):
             return "Lek - 1 time"
-        if re.search(r"\\b2\\s*(?:time|timer|t)\\b", low):
+        if re.search(r"\b2\s*(?:time|timer|t)\b", low):
             return "Lek - 2 timer"
         if "heldag" in low or "hele dagen" in low:
             return "Lek - heldag"
