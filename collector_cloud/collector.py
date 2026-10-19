@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import json
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 
 import httpx
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -223,6 +225,146 @@ async def read_wallmob(page: Page) -> dict[str, Any]:
         "gross_margin": margin,
         "message": "OK – hentet direkte i PWS Cloud",
     }
+
+
+def _safe_shape(value: Any, depth: int = 0) -> Any:
+    """Return a compact, secret-safe view of a JSON payload for Render logs."""
+    if depth > 4:
+        return "..."
+    if isinstance(value, dict):
+        out = {}
+        for key, item in list(value.items())[:30]:
+            low = str(key).lower()
+            if any(secret in low for secret in ("token", "password", "secret", "authorization", "cookie")):
+                out[key] = "<redacted>"
+            else:
+                out[key] = _safe_shape(item, depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_safe_shape(item, depth + 1) for item in value[:12]]
+    if isinstance(value, str) and len(value) > 180:
+        return value[:180] + "..."
+    return value
+
+
+async def probe_wallmob_top_products(page: Page, park: str) -> None:
+    """Discover Wallmob's top_products response shape without logging credentials."""
+    captured_headers: dict[str, str] = {}
+    captured_top_products: list[Any] = []
+
+    async def on_request(request):
+        nonlocal captured_headers
+        try:
+            if "bapi-etail.wallmob.com" not in request.url:
+                return
+            headers = await request.all_headers()
+            if headers:
+                captured_headers = headers
+        except Exception:
+            pass
+
+    async def on_response(response):
+        try:
+            url = response.url
+            if (
+                "bapi-etail.wallmob.com/reports/performance" in url
+                and "top_products" in url
+                and response.ok
+            ):
+                captured_top_products.append(await response.json())
+        except Exception:
+            pass
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+
+    try:
+        # Reload once so we can observe the same API headers the Wallmob frontend uses.
+        await page.reload(wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(2500)
+
+        if captured_top_products:
+            sample = _safe_shape(captured_top_products[-1])
+            print(
+                f"[{park}] TOP_PRODUCTS_PROBE captured="
+                + json.dumps(sample, ensure_ascii=False)[:4000],
+                flush=True,
+            )
+            return
+
+        allowed = {
+            "authorization",
+            "resource-token",
+            "x-resource-token",
+            "x-auth-token",
+            "accept",
+            "content-type",
+            "origin",
+            "referer",
+        }
+        api_headers = {
+            key: value
+            for key, value in captured_headers.items()
+            if key.lower() in allowed
+        }
+
+        now = datetime.now(OSLO)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        params = {
+            "starttime": int(start.timestamp()),
+            "endtime": int(now.timestamp()),
+            "interval_grouping": 999999999,
+            "include_vat": 1,
+            "reports": json.dumps(
+                [
+                    "turnover",
+                    "top_products",
+                    "top_users",
+                    "top_registers",
+                    "top_shops",
+                    "all_shops",
+                ],
+                separators=(",", ":"),
+            ),
+        }
+        url = "https://bapi-etail.wallmob.com/reports/performance?" + urlencode(params)
+
+        response = await page.context.request.get(url, headers=api_headers, timeout=30000)
+        status = response.status
+        body = await response.text()
+
+        if status >= 400:
+            print(
+                f"[{park}] TOP_PRODUCTS_PROBE HTTP {status}; "
+                f"captured_header_names={sorted(api_headers.keys())}",
+                flush=True,
+            )
+            return
+
+        try:
+            payload = json.loads(body)
+        except Exception:
+            print(
+                f"[{park}] TOP_PRODUCTS_PROBE non-json="
+                + re.sub(r"\s+", " ", body)[:1000],
+                flush=True,
+            )
+            return
+
+        sample = _safe_shape(payload)
+        print(
+            f"[{park}] TOP_PRODUCTS_PROBE fetched="
+            + json.dumps(sample, ensure_ascii=False)[:4000],
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[{park}] TOP_PRODUCTS_PROBE FEIL: {exc}", flush=True)
+    finally:
+        try:
+            page.remove_listener("request", on_request)
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
 
 
 async def login_nordpay(context: BrowserContext) -> Page:
@@ -552,6 +694,7 @@ class CloudCollector:
             "sorlandet": None,
             "triaden": None,
         }
+        self.wall_product_probe_done: set[str] = set()
         self.nord_state: dict[str, Any] | None = None
 
     async def _new_context(
@@ -593,6 +736,9 @@ class CloudCollector:
                     body = await page.locator("body").inner_text()
                     if "Dagens omsetning" in body:
                         data = await read_wallmob(page)
+                        if park not in self.wall_product_probe_done:
+                            await probe_wallmob_top_products(page, park)
+                            self.wall_product_probe_done.add(park)
                         self.wall_states[park] = await context.storage_state()
                         return data
                 except Exception:
@@ -610,6 +756,9 @@ class CloudCollector:
         try:
             page = await login_wallmob(context, username, password, login_type)
             data = await read_wallmob(page)
+            if park not in self.wall_product_probe_done:
+                await probe_wallmob_top_products(page, park)
+                self.wall_product_probe_done.add(park)
             self.wall_states[park] = await context.storage_state()
             return data
         finally:
