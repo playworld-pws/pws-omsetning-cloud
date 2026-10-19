@@ -19,7 +19,7 @@ CLOUD_URL = os.getenv("PWS_CLOUD_URL", "https://pws-omsetning-api.onrender.com")
 APP_KEY = os.getenv("PWS_APP_KEY", "")
 INGEST_KEY = os.getenv("PWS_INGEST_KEY", "")
 INTERVAL_SECONDS = max(30, int(os.getenv("PWS_COLLECT_INTERVAL", "60")))
-COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v2"
+COLLECTOR_BUILD = "2026-10-19-wallmob-capture-v3"
 
 WALLMOB_LOGIN_URL = os.getenv(
     "WALLMOB_LOGIN_URL", "https://wbo-etail.wallmob.com/login"
@@ -1590,6 +1590,71 @@ async def ingest_product_history(
         )
 
 
+async def capture_wallmob_performance_request(
+    page: Page,
+    park: str,
+) -> dict[str, Any] | None:
+    """Reload Wallmob and capture the exact top_products request + response."""
+    def wanted(url: str) -> bool:
+        return (
+            "bapi-etail.wallmob.com/reports/performance" in url
+            and "top_products" in url
+        )
+
+    try:
+        async with page.expect_request(
+            lambda request: wanted(request.url),
+            timeout=15000,
+        ) as request_info:
+            async with page.expect_response(
+                lambda response: wanted(response.url),
+                timeout=15000,
+            ) as response_info:
+                await page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=45000,
+                )
+
+        request = await request_info.value
+        response = await response_info.value
+        headers = await request.all_headers()
+
+        blocked = {
+            "host",
+            "content-length",
+            "connection",
+            "accept-encoding",
+            "cookie",
+        }
+        safe_request_headers = {
+            k: v
+            for k, v in headers.items()
+            if k.lower() not in blocked and not k.startswith(":")
+        }
+
+        payload = await response.json()
+        if not isinstance(payload, dict):
+            return None
+
+        print(
+            f"[{park}] WALLMOB_CAPTURE ok "
+            f"products={len(payload.get('top_products') or [])}; "
+            f"header_names={sorted(safe_request_headers.keys())}",
+            flush=True,
+        )
+        return {
+            "url": request.url,
+            "headers": safe_request_headers,
+            "payload": payload,
+        }
+    except Exception as exc:
+        print(
+            f"[{park}] WALLMOB_CAPTURE FEIL: {exc}",
+            flush=True,
+        )
+        return None
+
+
 class CloudCollector:
     """Memory-light collector.
 
@@ -1769,46 +1834,53 @@ class CloudCollector:
     async def fetch_wallmob(
         self, park: str, username: str, password: str, login_type: str
     ) -> dict[str, Any]:
-        state = self.wall_states.get(park)
-        context = await self._new_context(state)
-        capture = self._install_wallmob_capture(context, park)
-        try:
-            page = await context.new_page()
-
-            if state is not None:
-                try:
-                    await page.goto(
-                        WALLMOB_HOME_URL,
-                        wait_until="domcontentloaded",
-                        timeout=30000,
-                    )
-                    await page.wait_for_timeout(1200)
-                    body = await page.locator("body").inner_text()
-                    if "Dagens omsetning" in body:
-                        data = await read_wallmob(page)
-                        await page.wait_for_timeout(1200)
-                        self._save_wallmob_capture(park, capture, data)
-                        self.wall_states[park] = await context.storage_state()
-                        return data
-                except Exception:
-                    pass
-
-            try:
-                await page.close()
-            except Exception:
-                pass
-        finally:
-            await context.close()
-
-        context = await self._new_context()
-        capture = self._install_wallmob_capture(context, park)
-        try:
-            page = await login_wallmob(context, username, password, login_type)
+        async def read_live(
+            context: BrowserContext,
+            page: Page,
+        ) -> dict[str, Any]:
             data = await read_wallmob(page)
-            await page.wait_for_timeout(1200)
-            self._save_wallmob_capture(park, capture, data)
+
+            captured = await capture_wallmob_performance_request(page, park)
+            if captured is not None:
+                self.wall_report_templates[park] = {
+                    "url": captured["url"],
+                    "headers": captured["headers"],
+                }
+                products = wallmob_products_from_payload(captured["payload"])
+                data["product_sales"] = products
+                data["_product_sales_complete"] = True
+            else:
+                data["_product_sales_complete"] = False
+
             self.wall_states[park] = await context.storage_state()
             return data
+
+        state = self.wall_states.get(park)
+        if state is not None:
+            context = await self._new_context(state)
+            try:
+                page = await context.new_page()
+                await page.goto(
+                    WALLMOB_HOME_URL,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await page.wait_for_timeout(900)
+                body = await page.locator("body").inner_text()
+                if "Dagens omsetning" in body:
+                    return await read_live(context, page)
+            except Exception as exc:
+                print(
+                    f"[{park}] Wallmob lagret sesjon feilet: {exc}",
+                    flush=True,
+                )
+            finally:
+                await context.close()
+
+        context = await self._new_context()
+        try:
+            page = await login_wallmob(context, username, password, login_type)
+            return await read_live(context, page)
         finally:
             await context.close()
 
