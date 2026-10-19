@@ -523,6 +523,113 @@ async def read_nordpay(page: Page) -> dict[str, Any]:
     }
 
 
+def _safe_url_pattern(url: str) -> str:
+    # Keep route structure, but avoid dumping transaction/order identifiers.
+    url = re.sub(r"([?&][^=]+=)[^&]+", r"\\1<value>", url)
+    url = re.sub(r"/[0-9a-fA-F-]{8,}(?=/|$)", "/<id>", url)
+    url = re.sub(r"/\\d{3,}(?=/|$)", "/<id>", url)
+    return url[:500]
+
+
+async def probe_nordpay_products(page: Page) -> None:
+    """One-time, read-only discovery of where NordPay exposes ticket/product lines."""
+    try:
+        today = datetime.now(OSLO).strftime("%Y-%m-%d")
+        sales_tables = await nordpay_report_tables(
+            page, f"/manage/reports/sales?starts={today}&ends={today}"
+        )
+        compact_tables = []
+        for table in sales_tables[:4]:
+            compact_tables.append([row[:12] for row in table[:8]])
+        print(
+            "[nordpay] NORDPAY_PRODUCTS_PROBE sales_tables="
+            + json.dumps(compact_tables, ensure_ascii=False)[:3500],
+            flush=True,
+        )
+
+        seen_urls: set[str] = set()
+
+        async def on_response(response):
+            try:
+                u = response.url
+                low = u.lower()
+                if NORDPAY_BASE_URL in u and any(
+                    word in low
+                    for word in (
+                        "transaction",
+                        "order",
+                        "sale",
+                        "product",
+                        "item",
+                        "report",
+                    )
+                ):
+                    seen_urls.add(_safe_url_pattern(u))
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+        try:
+            await page.goto(
+                f"{NORDPAY_BASE_URL}/manage/transactions",
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
+            await page.wait_for_timeout(2500)
+
+            info = await page.evaluate(
+                """() => {
+                    const tables = Array.from(document.querySelectorAll('table')).map(t => ({
+                        headers: Array.from(t.querySelectorAll('thead th')).map(x => x.innerText.trim()),
+                        firstRows: Array.from(t.querySelectorAll('tbody tr')).slice(0,3).map(tr =>
+                            Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim()).slice(0,10)
+                        )
+                    }));
+                    const links = Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.getAttribute('href'))
+                        .filter(Boolean)
+                        .filter(h => /transaction|order|sale|product|item|report/i.test(h))
+                        .slice(0,30);
+                    const scripts = Array.from(document.querySelectorAll('script[src]'))
+                        .map(s => s.getAttribute('src'))
+                        .filter(Boolean)
+                        .filter(s => /transaction|order|sale|product|item|report/i.test(s))
+                        .slice(0,20);
+                    return {tables, links, scripts};
+                }"""
+            )
+
+            # Headers and route patterns are useful; row values may contain payment/customer
+            # data, so only log table headers, not transaction rows.
+            safe_info = {
+                "table_headers": [
+                    t.get("headers", [])[:15] for t in (info.get("tables") or [])[:6]
+                ],
+                "links": [_safe_url_pattern(str(x)) for x in (info.get("links") or [])],
+                "scripts": [str(x)[:300] for x in (info.get("scripts") or [])],
+                "network_urls": sorted(seen_urls)[:40],
+            }
+            print(
+                "[nordpay] NORDPAY_PRODUCTS_PROBE transactions="
+                + json.dumps(safe_info, ensure_ascii=False)[:5000],
+                flush=True,
+            )
+        finally:
+            try:
+                page.remove_listener("response", on_response)
+            except Exception:
+                pass
+
+        await page.goto(
+            f"{NORDPAY_BASE_URL}/dashboard",
+            wait_until="domcontentloaded",
+            timeout=45000,
+        )
+        await page.wait_for_timeout(700)
+    except Exception as exc:
+        print(f"[nordpay] NORDPAY_PRODUCTS_PROBE FEIL: {exc}", flush=True)
+
+
 WEATHER_CODES = {
     0: "Klart",
     1: "For det meste klart",
@@ -695,6 +802,7 @@ class CloudCollector:
             "triaden": None,
         }
         self.wall_product_probe_done: set[str] = set()
+        self.nord_product_probe_done = False
         self.nord_state: dict[str, Any] | None = None
 
     async def _new_context(
@@ -780,6 +888,9 @@ class CloudCollector:
                     body = await page.locator("body").inner_text()
                     if "DAGENS SALG" in body.upper():
                         data = await read_nordpay(page)
+                        if not self.nord_product_probe_done:
+                            await probe_nordpay_products(page)
+                            self.nord_product_probe_done = True
                         self.nord_state = await context.storage_state()
                         return data
                 except Exception:
@@ -796,6 +907,9 @@ class CloudCollector:
         try:
             page = await login_nordpay(context)
             data = await read_nordpay(page)
+            if not self.nord_product_probe_done:
+                await probe_nordpay_products(page)
+                self.nord_product_probe_done = True
             self.nord_state = await context.storage_state()
             return data
         finally:
