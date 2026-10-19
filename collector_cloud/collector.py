@@ -294,7 +294,7 @@ def _safe_shape(value: Any, depth: int = 0) -> Any:
     return value
 
 
-async def probe_wallmob_top_products(page: Page, park: str) -> None:
+async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True) -> dict[str, Any] | None:
     """Discover Wallmob's top_products response shape without logging credentials."""
     captured_headers: dict[str, str] = {}
     captured_top_products: list[Any] = []
@@ -331,13 +331,15 @@ async def probe_wallmob_top_products(page: Page, park: str) -> None:
         await page.wait_for_timeout(2500)
 
         if captured_top_products:
-            sample = _safe_shape(captured_top_products[-1])
-            print(
-                f"[{park}] TOP_PRODUCTS_PROBE captured="
-                + json.dumps(sample, ensure_ascii=False)[:4000],
-                flush=True,
-            )
-            return
+            payload = captured_top_products[-1]
+            if verbose:
+                sample = _safe_shape(payload)
+                print(
+                    f"[{park}] TOP_PRODUCTS_PROBE captured="
+                    + json.dumps(sample, ensure_ascii=False)[:4000],
+                    flush=True,
+                )
+            return payload
 
         allowed = {
             "authorization",
@@ -398,20 +400,47 @@ async def probe_wallmob_top_products(page: Page, park: str) -> None:
             )
             return
 
-        sample = _safe_shape(payload)
-        print(
-            f"[{park}] TOP_PRODUCTS_PROBE fetched="
-            + json.dumps(sample, ensure_ascii=False)[:4000],
-            flush=True,
-        )
+        if verbose:
+            sample = _safe_shape(payload)
+            print(
+                f"[{park}] TOP_PRODUCTS_PROBE fetched="
+                + json.dumps(sample, ensure_ascii=False)[:4000],
+                flush=True,
+            )
+        return payload
     except Exception as exc:
         print(f"[{park}] TOP_PRODUCTS_PROBE FEIL: {exc}", flush=True)
+        return None
     finally:
         try:
             page.remove_listener("request", on_request)
             page.remove_listener("response", on_response)
         except Exception:
             pass
+
+
+def wallmob_products_from_payload(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return result
+    for item in payload.get("top_products") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("product_name") or "").strip()
+        raw_turnover = parse_number(item.get("turnover"))
+        if not name or raw_turnover is None:
+            continue
+        result.append(
+            {
+                "name": name,
+                "quantity": None,
+                "revenue": round(raw_turnover / 100.0, 2),
+                "source": "wallmob",
+                "source_id": item.get("product_id"),
+            }
+        )
+    result.sort(key=lambda x: float(x.get("revenue") or 0), reverse=True)
+    return result
 
 
 async def login_nordpay(context: BrowserContext) -> Page:
@@ -1326,8 +1355,14 @@ class CloudCollector:
                     body = await page.locator("body").inner_text()
                     if "Dagens omsetning" in body:
                         data = await read_wallmob(page)
-                        if park not in self.wall_product_probe_done:
-                            await probe_wallmob_top_products(page, park)
+                        verbose = park not in self.wall_product_probe_done
+                        product_payload = await probe_wallmob_top_products(
+                            page, park, verbose=verbose
+                        )
+                        fresh_products = wallmob_products_from_payload(product_payload)
+                        if fresh_products:
+                            data["product_sales"] = fresh_products
+                        if verbose:
                             self.wall_product_probe_done.add(park)
                         self.wall_states[park] = await context.storage_state()
                         return data
@@ -1346,8 +1381,14 @@ class CloudCollector:
         try:
             page = await login_wallmob(context, username, password, login_type)
             data = await read_wallmob(page)
-            if park not in self.wall_product_probe_done:
-                await probe_wallmob_top_products(page, park)
+            verbose = park not in self.wall_product_probe_done
+            product_payload = await probe_wallmob_top_products(
+                page, park, verbose=verbose
+            )
+            fresh_products = wallmob_products_from_payload(product_payload)
+            if fresh_products:
+                data["product_sales"] = fresh_products
+            if verbose:
                 self.wall_product_probe_done.add(park)
             self.wall_states[park] = await context.storage_state()
             return data
