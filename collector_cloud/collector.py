@@ -1848,7 +1848,8 @@ class CloudCollector:
                 }
                 products = wallmob_products_from_payload(captured["payload"])
                 data["product_sales"] = products
-                data["_product_sales_complete"] = True
+                live_turnover = float(data.get("turnover") or 0)
+                data["_product_sales_complete"] = bool(products) or live_turnover == 0
             else:
                 data["_product_sales_complete"] = False
 
