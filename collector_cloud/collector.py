@@ -1603,6 +1603,7 @@ class CloudCollector:
             "triaden": None,
         }
         self.wall_product_probe_done: set[str] = set()
+        self.wall_report_templates: dict[str, dict[str, Any]] = {}
         self.nord_product_probe_done = False
         self.nord_state: dict[str, Any] | None = None
 
@@ -1625,15 +1626,153 @@ class CloudCollector:
         await context.route("**/*", block_heavy)
         return context
 
+    def _install_wallmob_capture(
+        self,
+        context: BrowserContext,
+        park: str,
+    ) -> dict[str, Any]:
+        capture: dict[str, Any] = {
+            "url": None,
+            "headers": None,
+            "payload": None,
+        }
+
+        async def on_request(request):
+            try:
+                url = request.url
+                if (
+                    "bapi-etail.wallmob.com/reports/performance" not in url
+                    or "top_products" not in url
+                ):
+                    return
+                headers = await request.all_headers()
+                blocked = {
+                    "host",
+                    "content-length",
+                    "connection",
+                    "accept-encoding",
+                    "cookie",
+                }
+                capture["url"] = url
+                capture["headers"] = {
+                    k: v
+                    for k, v in headers.items()
+                    if k.lower() not in blocked and not k.startswith(":")
+                }
+            except Exception:
+                pass
+
+        async def on_response(response):
+            try:
+                url = response.url
+                if (
+                    "bapi-etail.wallmob.com/reports/performance" in url
+                    and "top_products" in url
+                    and response.ok
+                ):
+                    payload = await response.json()
+                    if isinstance(payload, dict):
+                        capture["payload"] = payload
+            except Exception:
+                pass
+
+        context.on("request", on_request)
+        context.on("response", on_response)
+        return capture
+
+    def _save_wallmob_capture(
+        self,
+        park: str,
+        capture: dict[str, Any],
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        url = capture.get("url")
+        headers = capture.get("headers")
+        if url and isinstance(headers, dict) and headers:
+            self.wall_report_templates[park] = {
+                "url": url,
+                "headers": headers,
+            }
+
+        payload = capture.get("payload")
+        if data is not None and isinstance(payload, dict):
+            products = wallmob_products_from_payload(payload)
+            if products:
+                data["product_sales"] = products
+
+    async def _wallmob_history_payload(
+        self,
+        context: BrowserContext,
+        park: str,
+        target_date: date,
+    ) -> dict[str, Any] | None:
+        template = self.wall_report_templates.get(park)
+        if not template:
+            print(
+                f"[{park}] WALLMOB_HISTORY mangler fanget performance-request",
+                flush=True,
+            )
+            return None
+
+        original_url = str(template.get("url") or "")
+        headers = template.get("headers") or {}
+        parts = urlsplit(original_url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+
+        start = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            0,
+            0,
+            0,
+            tzinfo=OSLO,
+        )
+        end = start + timedelta(days=1) - timedelta(seconds=1)
+        query["starttime"] = str(int(start.timestamp()))
+        query["endtime"] = str(int(end.timestamp()))
+        query["include_vat"] = "1"
+
+        url = urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
+        response = await context.request.get(
+            url,
+            headers=headers,
+            timeout=30000,
+        )
+        if response.status >= 400:
+            print(
+                f"[{park}] WALLMOB_HISTORY HTTP {response.status} "
+                f"date={target_date.isoformat()}; template=True; "
+                f"header_names={sorted(headers.keys())}",
+                flush=True,
+            )
+            return None
+
+        try:
+            payload = await response.json()
+        except Exception:
+            body = await response.text()
+            print(
+                f"[{park}] WALLMOB_HISTORY non-json "
+                f"date={target_date.isoformat()}: "
+                + re.sub(r"\s+", " ", body)[:300],
+                flush=True,
+            )
+            return None
+
+        return payload if isinstance(payload, dict) else None
+
     async def fetch_wallmob(
         self, park: str, username: str, password: str, login_type: str
     ) -> dict[str, Any]:
         state = self.wall_states.get(park)
         context = await self._new_context(state)
+        capture = self._install_wallmob_capture(context, park)
         try:
             page = await context.new_page()
 
-            # Reuse the previous login session when possible.
             if state is not None:
                 try:
                     await page.goto(
@@ -1641,19 +1780,12 @@ class CloudCollector:
                         wait_until="domcontentloaded",
                         timeout=30000,
                     )
-                    await page.wait_for_timeout(900)
+                    await page.wait_for_timeout(1200)
                     body = await page.locator("body").inner_text()
                     if "Dagens omsetning" in body:
                         data = await read_wallmob(page)
-                        verbose = park not in self.wall_product_probe_done
-                        product_payload = await probe_wallmob_top_products(
-                            page, park, verbose=verbose
-                        )
-                        fresh_products = wallmob_products_from_payload(product_payload)
-                        if fresh_products:
-                            data["product_sales"] = fresh_products
-                        if verbose:
-                            self.wall_product_probe_done.add(park)
+                        await page.wait_for_timeout(1200)
+                        self._save_wallmob_capture(park, capture, data)
                         self.wall_states[park] = await context.storage_state()
                         return data
                 except Exception:
@@ -1666,20 +1798,13 @@ class CloudCollector:
         finally:
             await context.close()
 
-        # Session expired or first run: log in in a fresh lightweight context.
         context = await self._new_context()
+        capture = self._install_wallmob_capture(context, park)
         try:
             page = await login_wallmob(context, username, password, login_type)
             data = await read_wallmob(page)
-            verbose = park not in self.wall_product_probe_done
-            product_payload = await probe_wallmob_top_products(
-                page, park, verbose=verbose
-            )
-            fresh_products = wallmob_products_from_payload(product_payload)
-            if fresh_products:
-                data["product_sales"] = fresh_products
-            if verbose:
-                self.wall_product_probe_done.add(park)
+            await page.wait_for_timeout(1200)
+            self._save_wallmob_capture(park, capture, data)
             self.wall_states[park] = await context.storage_state()
             return data
         finally:
@@ -1693,75 +1818,45 @@ class CloudCollector:
         login_type: str,
         target_date: date,
     ) -> list[dict[str, Any]] | None:
-        async def read_from_context(
-            context: BrowserContext,
-            already_logged_in: bool,
-        ) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
-            if already_logged_in:
-                page = await context.new_page()
-                await page.goto(
-                    WALLMOB_HOME_URL,
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
-                await page.wait_for_timeout(1800)
-                body = await page.locator("body").inner_text()
-                if "Dagens omsetning" not in body:
-                    return None, None
-            else:
-                page = await login_wallmob(context, username, password, login_type)
+        # Ensure we have both an authenticated browser state and the exact
+        # performance request template generated by Wallmob itself.
+        if self.wall_states.get(park) is None or park not in self.wall_report_templates:
+            await self.fetch_wallmob(park, username, password, login_type)
 
-            payload = await probe_wallmob_top_products(
-                page,
-                park,
-                verbose=False,
-                target_date=target_date,
-            )
-            state = await context.storage_state()
-            if payload is None:
-                return None, state
-            return wallmob_products_from_payload(payload), state
+        for attempt in range(2):
+            state = self.wall_states.get(park)
+            if state is None:
+                return None
 
-        # First try the saved Wallmob session.
-        state = self.wall_states.get(park)
-        if state is not None:
             context = await self._new_context(state)
             try:
-                products, new_state = await read_from_context(context, True)
-                if new_state is not None:
-                    self.wall_states[park] = new_state
-                if products is not None:
-                    return products
-            except Exception as exc:
-                print(
-                    f"[{park}] Wallmob historikk: lagret sesjon feilet: {exc}",
-                    flush=True,
+                payload = await self._wallmob_history_payload(
+                    context,
+                    park,
+                    target_date,
                 )
+                if payload is not None:
+                    self.wall_states[park] = await context.storage_state()
+                    return wallmob_products_from_payload(payload)
             finally:
                 await context.close()
 
-        # Retry once with a fresh login. This also handles an expired resource token.
-        context = await self._new_context()
-        try:
-            products, new_state = await read_from_context(context, False)
-            if new_state is not None:
-                self.wall_states[park] = new_state
-            if products is None:
+            if attempt == 0:
                 print(
-                    f"[{park}] Wallmob historikk ga ingen data for "
-                    f"{target_date.isoformat()} etter ny innlogging",
+                    f"[{park}] Wallmob historikk prøver ny innlogging "
+                    f"for {target_date.isoformat()}",
                     flush=True,
                 )
-            return products
-        except Exception as exc:
-            print(
-                f"[{park}] Wallmob historikk ny innlogging feilet "
-                f"{target_date.isoformat()}: {exc}",
-                flush=True,
-            )
-            return None
-        finally:
-            await context.close()
+                self.wall_report_templates.pop(park, None)
+                self.wall_states[park] = None
+                await self.fetch_wallmob(park, username, password, login_type)
+
+        print(
+            f"[{park}] Wallmob historikk ga ingen data for "
+            f"{target_date.isoformat()} etter ny innlogging",
+            flush=True,
+        )
+        return None
 
     async def fetch_nordpay_products_for_date(
         self,
