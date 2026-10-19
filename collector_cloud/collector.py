@@ -1034,17 +1034,16 @@ async def read_nordpay_daily_products(page: Page) -> list[dict[str, Any]]:
 
             tax_text = str(row.get("Tax") or "")
             tax_amount = None
-            money_candidates = re.findall(
-                r"[-+]?[0-9][0-9 .]*(?:[.,][0-9]{2})?(?:,-)?\\s*(?:kr)?",
+
+            # Example from NordPay: "12%\n18.11,-kr".
+            # Capture the monetary tax amount after the percent value.
+            m_tax = re.search(
+                r"%\s*([0-9]+(?:[.,][0-9]{2})?)\s*(?:,-)?\s*kr",
                 tax_text,
                 flags=re.IGNORECASE,
             )
-            if money_candidates:
-                # Tax cells usually contain percentage first and tax amount second.
-                parsed = [parse_nordpay_money(x) for x in money_candidates]
-                parsed = [x for x in parsed if x is not None]
-                if parsed:
-                    tax_amount = parsed[-1]
+            if m_tax:
+                tax_amount = parse_nordpay_money(m_tax.group(1))
 
             revenue = None
             if net is not None:
