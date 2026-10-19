@@ -7,7 +7,7 @@ import json
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -297,19 +297,23 @@ def _safe_shape(value: Any, depth: int = 0) -> Any:
 async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True, target_date: date | None = None) -> dict[str, Any] | None:
     """Discover Wallmob's top_products response shape without logging credentials."""
     captured_headers: dict[str, str] = {}
+    captured_performance_url = ""
     captured_top_products: list[Any] = []
 
     async def on_request(request):
-        nonlocal captured_headers
+        nonlocal captured_headers, captured_performance_url
         try:
-            # Historical report calls need the same auth/resource headers as
-            # Wallmob's own performance-report request. Do not overwrite these
-            # with headers from unrelated public/configuration API calls.
-            if "bapi-etail.wallmob.com/reports/performance" not in request.url:
+            # Capture the exact performance request made by Wallmob itself.
+            # This preserves any shop/account filters and proprietary auth headers.
+            if (
+                "bapi-etail.wallmob.com/reports/performance" not in request.url
+                or "top_products" not in request.url
+            ):
                 return
             headers = await request.all_headers()
             if headers:
                 captured_headers = headers
+            captured_performance_url = request.url
         except Exception:
             pass
 
@@ -347,20 +351,18 @@ async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True
                 )
             return payload
 
-        allowed = {
-            "authorization",
-            "resource-token",
-            "x-resource-token",
-            "x-auth-token",
-            "accept",
-            "content-type",
-            "origin",
-            "referer",
+        # Reuse all safe headers from Wallmob's own performance request.
+        # A proprietary token/header may otherwise be lost if we hard-code names.
+        blocked_headers = {
+            "host",
+            "content-length",
+            "connection",
+            "accept-encoding",
         }
         api_headers = {
             key: value
             for key, value in captured_headers.items()
-            if key.lower() in allowed
+            if key.lower() not in blocked_headers and not key.startswith(":")
         }
 
         start = datetime(
@@ -377,24 +379,34 @@ async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True
         else:
             end = start + timedelta(days=1) - timedelta(seconds=1)
 
-        params = {
-            "starttime": int(start.timestamp()),
-            "endtime": int(end.timestamp()),
-            "interval_grouping": 999999999,
-            "include_vat": 1,
-            "reports": json.dumps(
-                [
-                    "turnover",
-                    "top_products",
-                    "top_users",
-                    "top_registers",
-                    "top_shops",
-                    "all_shops",
-                ],
-                separators=(",", ":"),
-            ),
-        }
-        url = "https://bapi-etail.wallmob.com/reports/performance?" + urlencode(params)
+        if captured_performance_url:
+            parts = urlsplit(captured_performance_url)
+            query = dict(parse_qsl(parts.query, keep_blank_values=True))
+            query["starttime"] = str(int(start.timestamp()))
+            query["endtime"] = str(int(end.timestamp()))
+            query["include_vat"] = "1"
+            url = urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+            )
+        else:
+            params = {
+                "starttime": int(start.timestamp()),
+                "endtime": int(end.timestamp()),
+                "interval_grouping": 999999999,
+                "include_vat": 1,
+                "reports": json.dumps(
+                    [
+                        "turnover",
+                        "top_products",
+                        "top_users",
+                        "top_registers",
+                        "top_shops",
+                        "all_shops",
+                    ],
+                    separators=(",", ":"),
+                ),
+            }
+            url = "https://bapi-etail.wallmob.com/reports/performance?" + urlencode(params)
 
         response = await page.context.request.get(url, headers=api_headers, timeout=30000)
         status = response.status
@@ -404,7 +416,8 @@ async def probe_wallmob_top_products(page: Page, park: str, verbose: bool = True
             print(
                 f"[{park}] WALLMOB_HISTORY HTTP {status} "
                 f"date={requested_date.isoformat()}; "
-                f"captured_header_names={sorted(api_headers.keys())}",
+                f"captured_header_names={sorted(api_headers.keys())}; "
+                f"captured_url={bool(captured_performance_url)}",
                 flush=True,
             )
             return None
