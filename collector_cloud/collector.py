@@ -845,14 +845,14 @@ async def probe_nordpay_products(page: Page) -> None:
                                     }""",
                                     candidate,
                                 )
-                                query_results.push({
+                                query_results.append({
                                     "url": _safe_url_pattern(candidate),
                                     "ok": bool(result.get("ok")),
                                     "status": result.get("status"),
                                     "rows": result.get("rows") or [],
                                 })
                             except Exception as exc:
-                                query_results.push({
+                                query_results.append({
                                     "url": _safe_url_pattern(candidate),
                                     "ok": False,
                                     "error": str(exc)[:160],
