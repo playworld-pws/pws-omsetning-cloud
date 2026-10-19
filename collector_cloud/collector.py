@@ -1680,17 +1680,23 @@ class CloudCollector:
         login_type: str,
         target_date: date,
     ) -> list[dict[str, Any]] | None:
-        if self.wall_states.get(park) is None:
-            await self.fetch_wallmob(park, username, password, login_type)
-
-        context = await self._new_context(self.wall_states.get(park))
-        try:
-            page = await context.new_page()
-            await page.goto(WALLMOB_HOME_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(700)
-            body = await page.locator("body").inner_text()
-            if "Dagens omsetning" not in body:
-                return None
+        async def read_from_context(
+            context: BrowserContext,
+            already_logged_in: bool,
+        ) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
+            if already_logged_in:
+                page = await context.new_page()
+                await page.goto(
+                    WALLMOB_HOME_URL,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await page.wait_for_timeout(1800)
+                body = await page.locator("body").inner_text()
+                if "Dagens omsetning" not in body:
+                    return None, None
+            else:
+                page = await login_wallmob(context, username, password, login_type)
 
             payload = await probe_wallmob_top_products(
                 page,
@@ -1698,10 +1704,49 @@ class CloudCollector:
                 verbose=False,
                 target_date=target_date,
             )
-            self.wall_states[park] = await context.storage_state()
+            state = await context.storage_state()
             if payload is None:
-                return None
-            return wallmob_products_from_payload(payload)
+                return None, state
+            return wallmob_products_from_payload(payload), state
+
+        # First try the saved Wallmob session.
+        state = self.wall_states.get(park)
+        if state is not None:
+            context = await self._new_context(state)
+            try:
+                products, new_state = await read_from_context(context, True)
+                if new_state is not None:
+                    self.wall_states[park] = new_state
+                if products is not None:
+                    return products
+            except Exception as exc:
+                print(
+                    f"[{park}] Wallmob historikk: lagret sesjon feilet: {exc}",
+                    flush=True,
+                )
+            finally:
+                await context.close()
+
+        # Retry once with a fresh login. This also handles an expired resource token.
+        context = await self._new_context()
+        try:
+            products, new_state = await read_from_context(context, False)
+            if new_state is not None:
+                self.wall_states[park] = new_state
+            if products is None:
+                print(
+                    f"[{park}] Wallmob historikk ga ingen data for "
+                    f"{target_date.isoformat()} etter ny innlogging",
+                    flush=True,
+                )
+            return products
+        except Exception as exc:
+            print(
+                f"[{park}] Wallmob historikk ny innlogging feilet "
+                f"{target_date.isoformat()}: {exc}",
+                flush=True,
+            )
+            return None
         finally:
             await context.close()
 
