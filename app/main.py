@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import Base, SessionLocal, engine
-from .models import Snapshot
+from .models import DailyProduct, Snapshot
 
 
 OSLO = ZoneInfo("Europe/Oslo")
@@ -164,4 +165,175 @@ def dates(
     return {
         "park": park,
         "dates": [value.isoformat() for value in values],
+    }
+
+
+def _product_key(name: str) -> str:
+    return " ".join(str(name or "").strip().casefold().split())[:255]
+
+
+def _period_bounds(target: date, period: str) -> tuple[date, date]:
+    value = period.strip().lower()
+    if value == "day":
+        return target, target
+    if value == "week":
+        start = target - timedelta(days=target.weekday())
+        return start, start + timedelta(days=6)
+    if value == "month":
+        start = target.replace(day=1)
+        last_day = monthrange(target.year, target.month)[1]
+        return start, target.replace(day=last_day)
+    raise HTTPException(status_code=400, detail="period må være day, week eller month")
+
+
+@app.post("/api/products/ingest/{park}", dependencies=[Depends(require_ingest_key)])
+def ingest_products(
+    park: str,
+    payload: dict[str, Any],
+    db: Session = Depends(db_session),
+) -> dict[str, Any]:
+    park = normalize_park(park)
+
+    raw_date = payload.get("business_date") or payload.get("date")
+    try:
+        business_date = date.fromisoformat(str(raw_date))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Ugyldig business_date") from exc
+
+    raw_products = payload.get("products")
+    if not isinstance(raw_products, list):
+        raise HTTPException(status_code=400, detail="products må være en liste")
+
+    # Each upload is the complete current picture for that park/date.
+    db.execute(
+        delete(DailyProduct).where(
+            DailyProduct.park == park,
+            DailyProduct.business_date == business_date,
+        )
+    )
+
+    inserted = 0
+    for raw in raw_products:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+
+        key = _product_key(name)
+        try:
+            revenue = float(raw.get("revenue") or 0)
+        except (TypeError, ValueError):
+            revenue = 0.0
+
+        quantity_raw = raw.get("quantity")
+        try:
+            quantity = None if quantity_raw is None else float(quantity_raw)
+        except (TypeError, ValueError):
+            quantity = None
+
+        db.add(
+            DailyProduct(
+                park=park,
+                business_date=business_date,
+                product_key=key,
+                product_name=name[:255],
+                quantity=quantity,
+                revenue=round(revenue, 2),
+            )
+        )
+        inserted += 1
+
+    db.commit()
+    return {
+        "ok": True,
+        "park": park,
+        "business_date": business_date.isoformat(),
+        "products": inserted,
+    }
+
+
+@app.get("/api/products", dependencies=[Depends(require_app_key)])
+def products(
+    park: str = Query(...),
+    period: str = Query(default="day"),
+    date_value: date | None = Query(default=None, alias="date"),
+    sort: str = Query(default="revenue"),
+    limit: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(db_session),
+) -> dict[str, Any]:
+    park = normalize_park(park)
+    target = date_value or datetime.now(OSLO).date()
+    start_date, end_date = _period_bounds(target, period)
+
+    rows = db.execute(
+        select(DailyProduct).where(
+            DailyProduct.park == park,
+            DailyProduct.business_date >= start_date,
+            DailyProduct.business_date <= end_date,
+        )
+    ).scalars().all()
+
+    grouped: dict[str, dict[str, Any]] = {}
+    covered_dates: set[str] = set()
+
+    for row in rows:
+        covered_dates.add(row.business_date.isoformat())
+        current = grouped.setdefault(
+            row.product_key,
+            {
+                "name": row.product_name,
+                "revenue": 0.0,
+                "quantity": 0.0,
+                "quantity_complete": True,
+            },
+        )
+        current["revenue"] += float(row.revenue or 0)
+        if row.quantity is None:
+            current["quantity_complete"] = False
+        else:
+            current["quantity"] += float(row.quantity)
+
+    result: list[dict[str, Any]] = []
+    for item in grouped.values():
+        result.append(
+            {
+                "name": item["name"],
+                "revenue": round(item["revenue"], 2),
+                "quantity": (
+                    round(item["quantity"], 2)
+                    if item["quantity_complete"]
+                    else None
+                ),
+                "quantity_complete": bool(item["quantity_complete"]),
+            }
+        )
+
+    sort_value = sort.strip().lower()
+    if sort_value == "quantity":
+        result.sort(
+            key=lambda x: (
+                x["quantity"] is not None,
+                float(x["quantity"] or 0),
+                float(x["revenue"] or 0),
+            ),
+            reverse=True,
+        )
+    elif sort_value == "revenue":
+        result.sort(key=lambda x: float(x["revenue"] or 0), reverse=True)
+    else:
+        raise HTTPException(status_code=400, detail="sort må være revenue eller quantity")
+
+    return {
+        "ok": True,
+        "park": park,
+        "period": period.strip().lower(),
+        "date": target.isoformat(),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "sort": sort_value,
+        "limit": limit,
+        "days_with_product_data": len(covered_dates),
+        "covered_dates": sorted(covered_dates),
+        "products": result[:limit],
     }
